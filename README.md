@@ -46,6 +46,8 @@ Notes:
 npm run dev
 ```
 
+If you run via `dist/` (e.g. `npm start` or an MCP config that points to `dist/index.js`), run `npm run build` after code changes.
+
 ## MCP tool
 
 Tool name: `nano_banana_generate_image`
@@ -61,7 +63,7 @@ Example arguments:
 ```
 
 Optional fields:
-- `referenceImages`: array of `{ "mimeType": "image/png", "data": "<base64>" }`
+- `referenceImages`: array of `{ "mimeType": "image/png", "data": "<base64>" }` (legacy; prefer URIs or local paths)
 - `referenceImageUris`: array of `{ "mimeType": "image/png", "fileUri": "gs://bucket/path.png" }`
 - `referenceImagePaths`: array of `{ "path": "/abs/path.png", "mimeType": "image/png" }` (uploads to GCS)
 - `responseModalities`: `["IMAGE"]` or `["TEXT", "IMAGE"]`

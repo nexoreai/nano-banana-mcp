@@ -370,7 +370,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_generate_image",
       description:
-        "Generate images with Gemini 3 Pro Image on Vertex AI.",
+        "Generate images with Gemini 3 Pro Image on Vertex AI. Prefer referenceImagePaths or referenceImageUris to avoid base64.",
       inputSchema: {
         type: "object",
         properties: {
@@ -381,7 +381,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           referenceImages: {
             type: "array",
             description:
-              "Optional base64-encoded images for editing or multi-image prompts.",
+              "Legacy base64-encoded images (prefer referenceImagePaths or referenceImageUris).",
             items: {
               type: "object",
               properties: {
