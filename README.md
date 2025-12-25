@@ -26,12 +26,18 @@ export GOOGLE_SERVICE_ACCOUNT_JSON=/absolute/path/to/service-account.json
 export VERTEX_PROJECT_ID=your-project
 export VERTEX_LOCATION=global
 export NANO_BANANA_MODEL=gemini-3-pro-image-preview
+export NANO_BANANA_GCS_BUCKET=your-reference-bucket
+export NANO_BANANA_GCS_PREFIX=nano-banana/refs
 ```
 
 Notes:
 - `GOOGLE_SERVICE_ACCOUNT_JSON` is required (JSON string or file path).
 - `VERTEX_PROJECT_ID` is optional if the service account JSON includes `project_id`.
 - The default model is `gemini-3-pro-image-preview` (Vertex preview). Override with another model ID if needed.
+- `NANO_BANANA_GCS_BUCKET` is required if you want the server to upload local reference images to GCS.
+- `NANO_BANANA_GCS_PREFIX` controls the object prefix for uploaded reference images (default: `nano-banana/refs`).
+- If you use GCS `fileUri` references, grant `Storage Object Viewer` to the Vertex AI service agent for the bucket.
+- If you use `referenceImagePaths`, the MCP service account needs `Storage Object Creator` (or broader) on the bucket.
 - If you see a 404 error with `global`, try a supported region like `us-central1` or `europe-west4`.
 
 ## Run
@@ -56,12 +62,43 @@ Example arguments:
 
 Optional fields:
 - `referenceImages`: array of `{ "mimeType": "image/png", "data": "<base64>" }`
+- `referenceImageUris`: array of `{ "mimeType": "image/png", "fileUri": "gs://bucket/path.png" }`
+- `referenceImagePaths`: array of `{ "path": "/abs/path.png", "mimeType": "image/png" }` (uploads to GCS)
 - `responseModalities`: `["IMAGE"]` or `["TEXT", "IMAGE"]`
 - `candidateCount`: integer 1-8
 - `imageSize`: `1K`, `2K`, `4K` (for models that support it)
 - `model`, `location`, `projectId`: overrides
+- `gcsBucket`: override the GCS bucket for uploads
+- `gcsUploadPrefix`: override the GCS object prefix for uploads
 - `outputDir`: directory to save generated images on disk (absolute or relative)
 - `outputFilePrefix`: filename prefix used when saving images
+
+Example with a GCS reference image:
+
+```json
+{
+  "prompt": "Use the reference image for style, generate a new scene.",
+  "referenceImageUris": [
+    {
+      "mimeType": "image/png",
+      "fileUri": "gs://my-bucket/reference.png"
+    }
+  ]
+}
+```
+
+Example uploading a local image and using it as a reference:
+
+```json
+{
+  "prompt": "Transform this into an isometric game scene.",
+  "referenceImagePaths": [
+    {
+      "path": "/absolute/path/to/reference.jpg"
+    }
+  ]
+}
+```
 
 ## References
 
