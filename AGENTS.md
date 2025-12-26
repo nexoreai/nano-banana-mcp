@@ -1,9 +1,9 @@
 # Repository Guidelines
 
-This project is an MCP server that generates images with Gemini 3 Pro Image on Vertex AI. This guide covers structure, workflows, and expectations for changes.
+This project is an MCP server that generates images with Gemini 3 Pro Image on Vertex AI and can produce true transparent PNGs. This guide covers structure, workflows, and expectations for changes.
 
 ## Project Structure & Module Organization
-- `src/index.ts` is the MCP server entrypoint (tool schema, auth, GCS uploads, and Vertex calls).
+- `src/index.ts` is the MCP server entrypoint (tool schema, auth, GCS uploads, Vertex calls, and transparency workflows).
 - `dist/` is the compiled output from TypeScript; treat it as build artifacts and do not edit by hand.
 - `public/` and `architecture.png` hold static docs/assets.
 - `tmp/` is gitignored scratch output for local experiments.
@@ -31,4 +31,6 @@ This project is an MCP server that generates images with Gemini 3 Pro Image on V
 
 ## Configuration & Security Notes
 - Required env vars include `GOOGLE_SERVICE_ACCOUNT_JSON` and, when needed, `NANO_BANANA_GCS_BUCKET`.
+- Transparency defaults are controlled via `NANO_BANANA_TRANSPARENCY_KEY_COLOR`, `NANO_BANANA_TRANSPARENCY_TOLERANCE`, and `NANO_BANANA_TRANSPARENCY_FEATHER`.
+- IMG.LY background removal can be configured via `NANO_BANANA_IMGLY_MODEL`, `NANO_BANANA_IMGLY_OUTPUT_FORMAT`, `NANO_BANANA_IMGLY_OUTPUT_QUALITY`, and `NANO_BANANA_IMGLY_PUBLIC_PATH`.
 - Never commit real service account JSON or `.env`; update `.env.example` when adding new settings.
