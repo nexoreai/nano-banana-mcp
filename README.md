@@ -28,6 +28,9 @@ export VERTEX_LOCATION=global
 export NANO_BANANA_MODEL=gemini-3-pro-image-preview
 export NANO_BANANA_GCS_BUCKET=your-reference-bucket
 export NANO_BANANA_GCS_PREFIX=nano-banana/refs
+export NANO_BANANA_OUTPUT_GCS_BUCKET=your-output-bucket
+export NANO_BANANA_OUTPUT_GCS_PREFIX=nano-banana/outputs
+export NANO_BANANA_OUTPUT_DIR=~/nano-banana-outputs
 ```
 
 Notes:
@@ -36,8 +39,12 @@ Notes:
 - The default model is `gemini-3-pro-image-preview` (Vertex preview). Override with another model ID if needed.
 - `NANO_BANANA_GCS_BUCKET` is required if you want the server to upload local reference images to GCS.
 - `NANO_BANANA_GCS_PREFIX` controls the object prefix for uploaded reference images (default: `nano-banana/refs`).
+- `NANO_BANANA_OUTPUT_GCS_BUCKET` controls the GCS bucket for generated images (defaults to `NANO_BANANA_GCS_BUCKET`).
+- `NANO_BANANA_OUTPUT_GCS_PREFIX` controls the object prefix for generated images (default: `nano-banana/outputs`).
+- `NANO_BANANA_OUTPUT_DIR` sets the local save root (defaults to `~/nano-banana-outputs`). Relative `outputDir` values resolve under this path.
 - If you use GCS `fileUri` references, grant `Storage Object Viewer` to the Vertex AI service agent for the bucket.
 - If you use `referenceImagePaths`, the MCP service account needs `Storage Object Creator` (or broader) on the bucket.
+- For generated image uploads, the MCP service account needs `Storage Object Creator` (or broader) on the output bucket.
 - If you see a 404 error with `global`, try a supported region like `us-central1` or `europe-west4`.
 
 ## Run
@@ -62,6 +69,9 @@ Example arguments:
 }
 ```
 
+Responses include GCS URIs (and HTTP URLs) for generated images; image bytes are uploaded to GCS to avoid large MCP payloads.
+Generated images are also saved locally under `NANO_BANANA_OUTPUT_DIR` (or `outputDir`).
+
 Optional fields:
 - `referenceImages`: array of `{ "mimeType": "image/png", "data": "<base64>" }` (legacy; prefer URIs or local paths)
 - `referenceImageUris`: array of `{ "mimeType": "image/png", "fileUri": "gs://bucket/path.png" }`
@@ -72,8 +82,10 @@ Optional fields:
 - `model`, `location`, `projectId`: overrides
 - `gcsBucket`: override the GCS bucket for uploads
 - `gcsUploadPrefix`: override the GCS object prefix for uploads
-- `outputDir`: directory to save generated images on disk (absolute or relative)
-- `outputFilePrefix`: filename prefix used when saving images
+- `outputGcsBucket`: override the GCS bucket for generated image uploads
+- `outputGcsPrefix`: override the GCS object prefix for generated image uploads
+- `outputDir`: directory to save generated images on disk (relative paths resolve under `NANO_BANANA_OUTPUT_DIR`)
+- `outputFilePrefix`: filename prefix used when saving images and naming GCS objects
 
 Example with a GCS reference image:
 

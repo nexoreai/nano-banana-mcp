@@ -21,6 +21,13 @@ const DEFAULT_PROJECT_ID =
 const DEFAULT_GCS_BUCKET = process.env.NANO_BANANA_GCS_BUCKET;
 const DEFAULT_GCS_UPLOAD_PREFIX =
   process.env.NANO_BANANA_GCS_PREFIX ?? "nano-banana/refs";
+const DEFAULT_OUTPUT_GCS_BUCKET =
+  process.env.NANO_BANANA_OUTPUT_GCS_BUCKET ?? DEFAULT_GCS_BUCKET;
+const DEFAULT_OUTPUT_GCS_PREFIX =
+  process.env.NANO_BANANA_OUTPUT_GCS_PREFIX ?? "nano-banana/outputs";
+const DEFAULT_OUTPUT_DIR =
+  process.env.NANO_BANANA_OUTPUT_DIR ??
+  path.join(os.homedir(), "nano-banana-outputs");
 
 type ReferenceImage = {
   mimeType: string;
@@ -55,6 +62,8 @@ type ToolArgs = {
   projectId?: string;
   gcsBucket?: string;
   gcsUploadPrefix?: string;
+  outputGcsBucket?: string;
+  outputGcsPrefix?: string;
   outputDir?: string;
   outputFilePrefix?: string;
 };
@@ -100,10 +109,11 @@ function normalizeBase64(data: string): string {
   return match ? match[1] : trimmed;
 }
 
-function normalizeGcsPrefix(prefix?: string): string {
-  const trimmed = (prefix ?? DEFAULT_GCS_UPLOAD_PREFIX).trim();
+function normalizeGcsPrefix(prefix?: string, fallback?: string): string {
+  const fallbackValue = (fallback ?? DEFAULT_GCS_UPLOAD_PREFIX).trim();
+  const trimmed = (prefix ?? fallbackValue).trim();
   if (!trimmed) {
-    return "nano-banana/refs";
+    return fallbackValue || "nano-banana/refs";
   }
   return trimmed.replace(/^\/+|\/+$/g, "");
 }
@@ -180,6 +190,24 @@ function resolveGcsBucket(args: ToolArgs): string | null {
   return trimmed ? trimmed : null;
 }
 
+function resolveOutputGcsBucket(args: ToolArgs): string | null {
+  const bucket = args.outputGcsBucket ?? DEFAULT_OUTPUT_GCS_BUCKET;
+  const trimmed = bucket?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function resolveOutputDir(outputDir?: string): string {
+  const baseDir = resolveLocalPath(DEFAULT_OUTPUT_DIR);
+  const trimmed = outputDir?.trim();
+  if (!trimmed) {
+    return baseDir;
+  }
+  if (trimmed.startsWith("~" + path.sep) || path.isAbsolute(trimmed)) {
+    return resolveLocalPath(trimmed);
+  }
+  return path.resolve(baseDir, trimmed);
+}
+
 async function resolveProjectId(): Promise<string> {
   if (DEFAULT_PROJECT_ID) {
     return DEFAULT_PROJECT_ID;
@@ -201,15 +229,29 @@ async function uploadFileToGcs(options: {
   mimeType: string;
   filePath: string;
 }) {
-  const client = await getAuthClient();
   const fileBuffer = await readFile(options.filePath);
+  await uploadBufferToGcs({
+    bucket: options.bucket,
+    objectName: options.objectName,
+    mimeType: options.mimeType,
+    data: fileBuffer,
+  });
+}
+
+async function uploadBufferToGcs(options: {
+  bucket: string;
+  objectName: string;
+  mimeType: string;
+  data: Buffer;
+}) {
+  const client = await getAuthClient();
   const encodedObjectName = encodeURIComponent(options.objectName);
   const url = `https://storage.googleapis.com/upload/storage/v1/b/${options.bucket}/o?uploadType=media&name=${encodedObjectName}`;
 
   await client.request({
     url,
     method: "POST",
-    data: fileBuffer,
+    data: options.data,
     headers: {
       "Content-Type": options.mimeType,
     },
@@ -261,7 +303,10 @@ async function generateImage(args: ToolArgs): Promise<{
         "GCS bucket not set. Provide gcsBucket or set NANO_BANANA_GCS_BUCKET."
       );
     }
-    const prefix = normalizeGcsPrefix(args.gcsUploadPrefix);
+    const prefix = normalizeGcsPrefix(
+      args.gcsUploadPrefix,
+      DEFAULT_GCS_UPLOAD_PREFIX
+    );
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 
     for (let i = 0; i < args.referenceImagePaths.length; i += 1) {
@@ -370,7 +415,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_generate_image",
       description:
-        "Generate images with Gemini 3 Pro Image on Vertex AI. Prefer referenceImagePaths or referenceImageUris to avoid base64.",
+        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. Prefer referenceImagePaths or referenceImageUris to avoid base64.",
       inputSchema: {
         type: "object",
         properties: {
@@ -506,15 +551,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "GCS object prefix for uploaded reference images.",
             default: DEFAULT_GCS_UPLOAD_PREFIX,
           },
+          outputGcsBucket: {
+            type: "string",
+            description: `GCS bucket for generated image uploads${
+              DEFAULT_OUTPUT_GCS_BUCKET
+                ? ` (default: ${DEFAULT_OUTPUT_GCS_BUCKET})`
+                : ""
+            }.`,
+            ...(DEFAULT_OUTPUT_GCS_BUCKET
+              ? { default: DEFAULT_OUTPUT_GCS_BUCKET }
+              : {}),
+          },
+          outputGcsPrefix: {
+            type: "string",
+            description: "GCS object prefix for generated image uploads.",
+            default: DEFAULT_OUTPUT_GCS_PREFIX,
+          },
           outputDir: {
             type: "string",
             description:
-              "Optional directory to save generated images on disk.",
+              "Directory to save generated images on disk (relative paths resolve under NANO_BANANA_OUTPUT_DIR).",
+            default: DEFAULT_OUTPUT_DIR,
           },
           outputFilePrefix: {
             type: "string",
             description:
-              "Optional filename prefix when saving images to disk.",
+              "Optional filename prefix used for GCS object names and local files.",
           },
         },
       },
@@ -548,10 +610,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
-    const content: Array<
-      | { type: "text"; text: string }
-      | { type: "image"; mimeType: string; data: string }
-    > = [];
+    const content: Array<{ type: "text"; text: string }> = [];
 
     content.push({
       type: "text",
@@ -573,27 +632,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
     }
 
-    for (const image of images) {
-      content.push({
-        type: "image",
-        mimeType: image.mimeType,
-        data: image.data,
-      });
-    }
+    if (images.length > 0) {
+      const outputTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const outputPrefix = args.outputFilePrefix?.trim() || "nano-banana";
+      const outputBucket = resolveOutputGcsBucket(args);
+      if (!outputBucket) {
+        throw new Error(
+          "Output GCS bucket not set. Provide outputGcsBucket or set NANO_BANANA_OUTPUT_GCS_BUCKET (or NANO_BANANA_GCS_BUCKET)."
+        );
+      }
+      const outputGcsPrefix = normalizeGcsPrefix(
+        args.outputGcsPrefix,
+        DEFAULT_OUTPUT_GCS_PREFIX
+      );
+      const uploadedOutputUris: string[] = [];
+      const uploadedOutputUrls: string[] = [];
 
-    if (args.outputDir && images.length > 0) {
-      const resolvedOutputDir = path.resolve(args.outputDir);
+      for (let i = 0; i < images.length; i += 1) {
+        const image = images[i];
+        const ext = extensionForMimeType(image.mimeType);
+        const filename = `${outputPrefix}-${outputTimestamp}-${i + 1}.${ext}`;
+        const objectName = `${outputGcsPrefix}/${filename}`;
+        await uploadBufferToGcs({
+          bucket: outputBucket,
+          objectName,
+          mimeType: image.mimeType,
+          data: Buffer.from(normalizeBase64(image.data), "base64"),
+        });
+        uploadedOutputUris.push(`gs://${outputBucket}/${objectName}`);
+        uploadedOutputUrls.push(
+          `https://storage.googleapis.com/${outputBucket}/${objectName}`
+        );
+      }
+
+      content.push({
+        type: "text",
+        text: `Uploaded ${uploadedOutputUris.length} generated image(s) to:\n${uploadedOutputUris.join(
+          "\n"
+        )}`,
+      });
+      content.push({
+        type: "text",
+        text: `HTTP URL(s) (requires bucket access):\n${uploadedOutputUrls.join(
+          "\n"
+        )}`,
+      });
+
+      const resolvedOutputDir = resolveOutputDir(args.outputDir);
       await mkdir(resolvedOutputDir, { recursive: true });
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const prefix = args.outputFilePrefix?.trim() || "nano-banana";
       const savedPaths: string[] = [];
 
       for (let i = 0; i < images.length; i += 1) {
         const image = images[i];
         const ext = extensionForMimeType(image.mimeType);
-        const filename = `${prefix}-${timestamp}-${i + 1}.${ext}`;
+        const filename = `${outputPrefix}-${outputTimestamp}-${i + 1}.${ext}`;
         const outputPath = path.join(resolvedOutputDir, filename);
-        await writeFile(outputPath, Buffer.from(image.data, "base64"));
+        await writeFile(
+          outputPath,
+          Buffer.from(normalizeBase64(image.data), "base64")
+        );
         savedPaths.push(outputPath);
       }
 
