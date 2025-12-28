@@ -31,6 +31,8 @@ This project is an MCP server that generates images with Gemini 3 Pro Image on V
 
 ## Configuration & Security Notes
 - Required env vars include `GOOGLE_SERVICE_ACCOUNT_JSON` and, when needed, `NANO_BANANA_GCS_BUCKET`.
+- Long-running tool calls can emit progress heartbeats via `NANO_BANANA_PROGRESS_INTERVAL_MS` (set `0` to disable).
+- Task mode is backed by an in-memory task store; task state is lost on server restart.
 - Transparency defaults are controlled via `NANO_BANANA_TRANSPARENCY_KEY_COLOR`, `NANO_BANANA_TRANSPARENCY_TOLERANCE`, and `NANO_BANANA_TRANSPARENCY_FEATHER`.
 - IMG.LY background removal can be configured via `NANO_BANANA_IMGLY_MODEL`, `NANO_BANANA_IMGLY_OUTPUT_FORMAT`, `NANO_BANANA_IMGLY_OUTPUT_QUALITY`, and `NANO_BANANA_IMGLY_PUBLIC_PATH`.
 - Never commit real service account JSON or `.env`; update `.env.example` when adding new settings.

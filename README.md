@@ -31,6 +31,7 @@ export NANO_BANANA_GCS_PREFIX=nano-banana/refs
 export NANO_BANANA_OUTPUT_GCS_BUCKET=your-output-bucket
 export NANO_BANANA_OUTPUT_GCS_PREFIX=nano-banana/outputs
 export NANO_BANANA_OUTPUT_DIR=~/nano-banana-outputs
+export NANO_BANANA_PROGRESS_INTERVAL_MS=20000
 ```
 
 Notes:
@@ -42,6 +43,7 @@ Notes:
 - `NANO_BANANA_OUTPUT_GCS_BUCKET` controls the GCS bucket for generated images (defaults to `NANO_BANANA_GCS_BUCKET`).
 - `NANO_BANANA_OUTPUT_GCS_PREFIX` controls the object prefix for generated images (default: `nano-banana/outputs`).
 - `NANO_BANANA_OUTPUT_DIR` sets the local save root (defaults to `~/nano-banana-outputs`). Relative `outputDir` values resolve under this path.
+- `NANO_BANANA_PROGRESS_INTERVAL_MS` controls how often progress notifications are emitted (ms) to keep long MCP calls alive. Set `0` to disable.
 - If you use GCS `fileUri` references, grant `Storage Object Viewer` to the Vertex AI service agent for the bucket.
 - If you use `referenceImagePaths`, the MCP service account needs `Storage Object Creator` (or broader) on the bucket.
 - For generated image uploads, the MCP service account needs `Storage Object Creator` (or broader) on the output bucket.
@@ -54,6 +56,81 @@ npm run dev
 ```
 
 If you run via `dist/` (e.g. `npm start` or an MCP config that points to `dist/index.js`), run `npm run build` after code changes.
+
+## Long-running calls
+
+If your MCP client enforces the 60s default timeout, use progress notifications or task mode.
+
+Progress (keeps a single request alive by resetting the timeout):
+
+```ts
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+
+const client = new Client(
+  { name: "example-client", version: "0.1.0" },
+  { capabilities: {} }
+);
+
+await client.connect(
+  new StdioClientTransport({ command: "nano-banana-mcp" })
+);
+
+const result = await client.request(
+  {
+    method: "tools/call",
+    params: {
+      name: "nano_banana_generate_image",
+      arguments: {
+        prompt: "A cinematic landscape at golden hour",
+        aspectRatio: "16:9",
+      },
+    },
+  },
+  CallToolResultSchema,
+  {
+    onprogress: (progress) => {
+      console.log(progress.message ?? progress.progress);
+    },
+    resetTimeoutOnProgress: true,
+  }
+);
+```
+
+Tasks (returns immediately, then poll/stream the result):
+
+```ts
+const stream = client.experimental.tasks.callToolStream(
+  {
+    name: "nano_banana_generate_image",
+    arguments: {
+      prompt: "A cinematic landscape at golden hour",
+      aspectRatio: "16:9",
+    },
+  },
+  CallToolResultSchema,
+  {
+    task: {
+      ttl: 15 * 60 * 1000,
+      pollInterval: 1000,
+    },
+  }
+);
+
+for await (const message of stream) {
+  if (message.type === "taskStatus") {
+    console.log(message.task.status, message.task.statusMessage ?? "");
+  }
+  if (message.type === "result") {
+    console.log(message.result);
+  }
+}
+```
+
+Notes:
+- Task state is stored in memory; tasks are lost when the server restarts.
+- Task mode still benefits from progress notifications if the client subscribes.
 
 ## MCP tool
 

@@ -8,7 +8,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type ServerNotification,
+  type ServerRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import {
+  InMemoryTaskMessageQueue,
+  InMemoryTaskStore,
+} from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import { GoogleAuth } from "google-auth-library";
 import {
   removeBackground,
@@ -55,6 +62,8 @@ const DEFAULT_TRANSPARENCY_FEATHER = process.env
   .NANO_BANANA_TRANSPARENCY_FEATHER
   ? Number(process.env.NANO_BANANA_TRANSPARENCY_FEATHER)
   : 6;
+const DEFAULT_PROGRESS_INTERVAL_MS = 20000;
+const PROGRESS_INTERVAL_MS = resolveProgressIntervalMs();
 
 type ReferenceImage = {
   mimeType: string;
@@ -150,6 +159,11 @@ type GenerateContentResponse = {
       }>;
     };
   }>;
+};
+
+type ProgressReporter = {
+  report: (message?: string) => void;
+  startHeartbeat: (message: string) => () => void;
 };
 
 function extensionForMimeType(mimeType: string): string {
@@ -359,6 +373,65 @@ function resolveOutputDir(outputDir?: string): string {
     return resolveLocalPath(trimmed);
   }
   return path.resolve(baseDir, trimmed);
+}
+
+function resolveProgressIntervalMs(): number {
+  const raw = process.env.NANO_BANANA_PROGRESS_INTERVAL_MS;
+  if (!raw) {
+    return DEFAULT_PROGRESS_INTERVAL_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_PROGRESS_INTERVAL_MS;
+  }
+  return parsed > 0 ? parsed : 0;
+}
+
+function createProgressReporter(
+  extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+): ProgressReporter | null {
+  const progressToken = extra?._meta?.progressToken;
+  if (progressToken === undefined || !extra?.sendNotification) {
+    return null;
+  }
+
+  let progress = 0;
+  let disabled = false;
+
+  const report = (message?: string) => {
+    if (disabled) {
+      return;
+    }
+    progress += 1;
+    void extra
+      .sendNotification({
+        method: "notifications/progress",
+        params: {
+          progress,
+          ...(message ? { message } : {}),
+          progressToken,
+        },
+      })
+      .catch((error) => {
+        disabled = true;
+        console.warn("Progress notification failed:", error);
+      });
+  };
+
+  const startHeartbeat = (message: string) => {
+    if (PROGRESS_INTERVAL_MS <= 0) {
+      return () => {};
+    }
+    report(message);
+    const intervalId = setInterval(() => {
+      report(message);
+    }, PROGRESS_INTERVAL_MS);
+    return () => {
+      clearInterval(intervalId);
+    };
+  };
+
+  return { report, startHeartbeat };
 }
 
 async function resolveProjectId(): Promise<string> {
@@ -1038,12 +1111,17 @@ async function generateImage(args: ToolArgs): Promise<{
   };
 }
 
-async function handleGenerateImage(args: ToolArgs) {
+async function handleGenerateImage(
+  args: ToolArgs,
+  progress?: ProgressReporter | null
+) {
+  const stopHeartbeat = progress?.startHeartbeat("Generating image...");
   try {
     if (shouldAutoTransparent(args.prompt)) {
-      return await handleGenerateImageWithTransparency(args);
+      return await handleGenerateImageWithTransparency(args, progress);
     }
 
+    progress?.report("Requesting image generation.");
     const result = await generateImage(args);
     const { images, texts } = extractImagesAndTexts(result.response);
 
@@ -1070,6 +1148,7 @@ async function handleGenerateImage(args: ToolArgs) {
     }
 
     if (images.length > 0) {
+      progress?.report("Persisting generated images.");
       const outputImages = images.map((image) => ({
         mimeType: image.mimeType,
         data: Buffer.from(normalizeBase64(image.data), "base64"),
@@ -1117,10 +1196,15 @@ async function handleGenerateImage(args: ToolArgs) {
       content: [{ type: "text", text: `Nano Banana error: ${message}` }],
       isError: true,
     };
+  } finally {
+    stopHeartbeat?.();
   }
 }
 
-async function handleGenerateImageWithTransparency(args: ToolArgs) {
+async function handleGenerateImageWithTransparency(
+  args: ToolArgs,
+  progress?: ProgressReporter | null
+) {
   const content: Array<{ type: "text"; text: string }> = [];
   try {
     const keyColor =
@@ -1130,6 +1214,7 @@ async function handleGenerateImageWithTransparency(args: ToolArgs) {
       keyColor
     );
 
+    progress?.report("Requesting transparency-ready image.");
     const generateArgs: ToolArgs = {
       ...args,
       prompt: transparencyPrompt,
@@ -1156,6 +1241,7 @@ async function handleGenerateImageWithTransparency(args: ToolArgs) {
     }
 
     if (images.length > 0) {
+      progress?.report("Applying transparency.");
       const parsedKeyColor = parseHexColor(keyColor);
       const outputImages: Array<{ mimeType: string; data: Buffer }> = [];
 
@@ -1222,12 +1308,21 @@ async function handleGenerateImageWithTransparency(args: ToolArgs) {
   }
 }
 
-async function handleMakeTransparent(args: MakeTransparentArgs) {
+async function handleMakeTransparent(
+  args: MakeTransparentArgs,
+  progress?: ProgressReporter | null
+) {
+  const method: TransparentMethod = args.method ?? "imgly";
+  const heartbeatMessage =
+    method === "gemini"
+      ? "Generating transparent image..."
+      : "Removing background...";
+  const stopHeartbeat = progress?.startHeartbeat(heartbeatMessage);
   try {
-    const method: TransparentMethod = args.method ?? "imgly";
     const content: Array<{ type: "text"; text: string }> = [];
 
     if (method === "gemini") {
+      progress?.report("Requesting transparency via Gemini.");
       const geminiArgs = await buildGeminiArgsForTransparency(args);
       const result = await generateImage(geminiArgs);
       const { images, texts } = extractImagesAndTexts(result.response);
@@ -1302,6 +1397,7 @@ async function handleMakeTransparent(args: MakeTransparentArgs) {
     }
 
     if (method === "imgly") {
+      progress?.report("Running IMG.LY background removal.");
       const { buffer, mimeType } = await resolveSourceImageBuffer(
         args.sourceImage
       );
@@ -1399,6 +1495,7 @@ async function handleMakeTransparent(args: MakeTransparentArgs) {
     }
 
     if (method === "color-key") {
+      progress?.report("Applying color-key transparency.");
       const { buffer } = await resolveSourceImageBuffer(args.sourceImage);
       const color = args.color ? parseHexColor(args.color) : undefined;
       const outputBuffer = await applyColorKeyTransparency({
@@ -1459,6 +1556,7 @@ async function handleMakeTransparent(args: MakeTransparentArgs) {
     }
 
     if (method === "checkerboard") {
+      progress?.report("Detecting checkerboard background.");
       const { buffer } = await resolveSourceImageBuffer(args.sourceImage);
       const { outputBuffer, colors, coverage } =
         await applyCheckerboardTransparency({
@@ -1539,8 +1637,13 @@ async function handleMakeTransparent(args: MakeTransparentArgs) {
       content: [{ type: "text", text: `Nano Banana error: ${message}` }],
       isError: true,
     };
+  } finally {
+    stopHeartbeat?.();
   }
 }
+
+const taskStore = new InMemoryTaskStore();
+const taskMessageQueue = new InMemoryTaskMessageQueue();
 
 const server = new Server(
   {
@@ -1550,7 +1653,18 @@ const server = new Server(
   {
     capabilities: {
       tools: {},
+      tasks: {
+        list: {},
+        cancel: {},
+        requests: {
+          tools: {
+            call: {},
+          },
+        },
+      },
     },
+    taskStore,
+    taskMessageQueue,
   }
 );
 
@@ -1909,17 +2023,53 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  switch (request.params.name) {
-    case "nano_banana_generate_image":
-      return handleGenerateImage(request.params.arguments as ToolArgs);
-    case "nano_banana_make_transparent":
-      return handleMakeTransparent(
-        request.params.arguments as MakeTransparentArgs
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+  const progress = createProgressReporter(extra);
+  const taskParams = request.params.task;
+
+  const runTool = async () => {
+    switch (request.params.name) {
+      case "nano_banana_generate_image":
+        return handleGenerateImage(
+          request.params.arguments as ToolArgs,
+          progress
+        );
+      case "nano_banana_make_transparent":
+        return handleMakeTransparent(
+          request.params.arguments as MakeTransparentArgs,
+          progress
+        );
+      default:
+        throw new Error(`Unknown tool: ${request.params.name}`);
+    }
+  };
+
+  if (taskParams) {
+    if (!extra.taskStore) {
+      throw new Error(
+        "Task requests are not supported because no task store is configured."
       );
-    default:
-      throw new Error(`Unknown tool: ${request.params.name}`);
+    }
+
+    const task = await extra.taskStore.createTask(taskParams);
+    void (async () => {
+      try {
+        const result = await runTool();
+        const status = result.isError ? "failed" : "completed";
+        await extra.taskStore?.storeTaskResult(task.taskId, status, result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await extra.taskStore?.storeTaskResult(task.taskId, "failed", {
+          content: [{ type: "text", text: `Nano Banana error: ${message}` }],
+          isError: true,
+        });
+      }
+    })();
+
+    return { task };
   }
+
+  return runTool();
 });
 
 async function main() {
