@@ -2260,7 +2260,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_get_task",
       description:
-        "Get status/results for polling tasks returned by nano_banana_generate_image when auto-task is enabled.",
+        "Get status/results for polling tasks returned by nano_banana_generate_image when auto-task is enabled. Wait a few seconds between polls to avoid hammering the server.",
       inputSchema: {
         type: "object",
         required: ["taskId"],
