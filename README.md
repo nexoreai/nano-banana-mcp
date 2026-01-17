@@ -32,6 +32,8 @@ export NANO_BANANA_OUTPUT_GCS_BUCKET=your-output-bucket
 export NANO_BANANA_OUTPUT_GCS_PREFIX=nano-banana/outputs
 export NANO_BANANA_OUTPUT_DIR=~/nano-banana-outputs
 export NANO_BANANA_PROGRESS_INTERVAL_MS=20000
+export NANO_BANANA_AUTO_TASK_4K=true
+export NANO_BANANA_AUTO_TASK_TTL_MS=1200000
 export NANO_BANANA_OPAQUE_BACKGROUND_COLOR=auto
 ```
 
@@ -45,6 +47,8 @@ Notes:
 - `NANO_BANANA_OUTPUT_GCS_PREFIX` controls the object prefix for generated images (default: `nano-banana/outputs`).
 - `NANO_BANANA_OUTPUT_DIR` sets the local save root (defaults to `~/nano-banana-outputs`). Relative `outputDir` values resolve under this path.
 - `NANO_BANANA_PROGRESS_INTERVAL_MS` controls how often progress notifications are emitted (ms) to keep long MCP calls alive. Set `0` to disable.
+- `NANO_BANANA_AUTO_TASK_4K` runs 4K generations in task mode automatically to avoid client timeouts (set `false` to disable).
+- `NANO_BANANA_AUTO_TASK_TTL_MS` controls how long auto-task results remain available (ms). Set `0` for no expiry.
 - `NANO_BANANA_OPAQUE_BACKGROUND_COLOR` flattens non-transparent outputs onto a solid background (hex color or `auto` to sample the top-left pixel). Use `off` to keep alpha.
 - If you use GCS `fileUri` references, grant `Storage Object Viewer` to the Vertex AI service agent for the bucket.
 - If you use `referenceImagePaths`, the MCP service account needs `Storage Object Creator` (or broader) on the bucket.
@@ -62,6 +66,8 @@ If you run via `dist/` (e.g. `npm start` or an MCP config that points to `dist/i
 ## Long-running calls
 
 If your MCP client enforces the 60s default timeout, use progress notifications or task mode.
+
+4K generations are auto-run in task mode by default to avoid timeouts. Disable with `NANO_BANANA_AUTO_TASK_4K=false` if your client doesn't support tasks.
 
 Progress (keeps a single request alive by resetting the timeout):
 

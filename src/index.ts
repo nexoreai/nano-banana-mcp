@@ -69,6 +69,8 @@ const DEFAULT_OPAQUE_BACKGROUND_COLOR =
     ? "auto"
     : RAW_OPAQUE_BACKGROUND_COLOR.trim();
 const DEFAULT_PROGRESS_INTERVAL_MS = 20000;
+const DEFAULT_AUTO_TASK_4K = resolveAutoTask4k();
+const DEFAULT_AUTO_TASK_TTL_MS = resolveAutoTaskTtlMs();
 const PROGRESS_INTERVAL_MS = resolveProgressIntervalMs();
 
 type ReferenceImage = {
@@ -464,6 +466,33 @@ function resolveProgressIntervalMs(): number {
   return parsed > 0 ? parsed : 0;
 }
 
+function resolveAutoTask4k(): boolean {
+  const raw = process.env.NANO_BANANA_AUTO_TASK_4K;
+  if (!raw) {
+    return true;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return true;
+}
+
+function resolveAutoTaskTtlMs(): number | null {
+  const raw = process.env.NANO_BANANA_AUTO_TASK_TTL_MS;
+  if (!raw) {
+    return 20 * 60 * 1000;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return 20 * 60 * 1000;
+  }
+  return parsed > 0 ? parsed : null;
+}
+
 function createProgressReporter(
   extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
 ): ProgressReporter | null {
@@ -509,6 +538,28 @@ function createProgressReporter(
   };
 
   return { report, startHeartbeat };
+}
+
+function normalizeImageSize(value?: string): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed.toUpperCase();
+}
+
+function shouldAutoTaskFor4k(
+  toolName: string,
+  args?: ToolArgs | null
+): boolean {
+  if (!DEFAULT_AUTO_TASK_4K) {
+    return false;
+  }
+  if (toolName !== "nano_banana_generate_image") {
+    return false;
+  }
+  const imageSize = normalizeImageSize(args?.imageSize);
+  return imageSize === "4K";
 }
 
 async function resolveProjectId(): Promise<string> {
@@ -1771,7 +1822,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_generate_image",
       description:
-        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server will render on a key color and return a true transparent PNG automatically. Prefer referenceImagePaths or referenceImageUris to avoid base64.",
+        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server will render on a key color and return a true transparent PNG automatically. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a task immediately to avoid client timeouts.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2132,6 +2183,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const progress = createProgressReporter(extra);
   const taskParams = request.params.task;
+  const autoTask =
+    !taskParams &&
+    shouldAutoTaskFor4k(
+      request.params.name,
+      request.params.arguments as ToolArgs
+    );
 
   const runTool = async () => {
     switch (request.params.name) {
@@ -2150,14 +2207,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   };
 
-  if (taskParams) {
+  if (taskParams || autoTask) {
     if (!extra.taskStore) {
       throw new Error(
         "Task requests are not supported because no task store is configured."
       );
     }
 
-    const task = await extra.taskStore.createTask(taskParams);
+    const taskOptions = taskParams ?? {
+      ttl: DEFAULT_AUTO_TASK_TTL_MS,
+    };
+    const task = await extra.taskStore.createTask(taskOptions);
     void (async () => {
       try {
         const result = await runTool();
