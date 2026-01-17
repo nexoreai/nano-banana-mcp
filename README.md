@@ -32,6 +32,7 @@ export NANO_BANANA_OUTPUT_GCS_BUCKET=your-output-bucket
 export NANO_BANANA_OUTPUT_GCS_PREFIX=nano-banana/outputs
 export NANO_BANANA_OUTPUT_DIR=~/nano-banana-outputs
 export NANO_BANANA_PROGRESS_INTERVAL_MS=20000
+export NANO_BANANA_OPAQUE_BACKGROUND_COLOR=auto
 ```
 
 Notes:
@@ -44,6 +45,7 @@ Notes:
 - `NANO_BANANA_OUTPUT_GCS_PREFIX` controls the object prefix for generated images (default: `nano-banana/outputs`).
 - `NANO_BANANA_OUTPUT_DIR` sets the local save root (defaults to `~/nano-banana-outputs`). Relative `outputDir` values resolve under this path.
 - `NANO_BANANA_PROGRESS_INTERVAL_MS` controls how often progress notifications are emitted (ms) to keep long MCP calls alive. Set `0` to disable.
+- `NANO_BANANA_OPAQUE_BACKGROUND_COLOR` flattens non-transparent outputs onto a solid background (hex color or `auto` to sample the top-left pixel). Use `off` to keep alpha.
 - If you use GCS `fileUri` references, grant `Storage Object Viewer` to the Vertex AI service agent for the bucket.
 - If you use `referenceImagePaths`, the MCP service account needs `Storage Object Creator` (or broader) on the bucket.
 - For generated image uploads, the MCP service account needs `Storage Object Creator` (or broader) on the output bucket.
@@ -156,6 +158,7 @@ Optional fields:
 - `referenceImageUris`: array of `{ "mimeType": "image/png", "fileUri": "gs://bucket/path.png" }`
 - `referenceImagePaths`: array of `{ "path": "/abs/path.png", "mimeType": "image/png" }` (uploads to GCS)
 - `transparencyKeyColor`: hex key color used when auto transparency is triggered (default: `#00ff00`)
+- `opaqueBackgroundColor`: hex color (or `auto`) to flatten outputs and remove alpha when transparency is not requested; use `off` to keep alpha
 - `responseModalities`: `["IMAGE"]` or `["TEXT", "IMAGE"]`
 - `candidateCount`: integer 1-8
 - `imageSize`: `1K`, `2K`, `4K` (for models that support it)

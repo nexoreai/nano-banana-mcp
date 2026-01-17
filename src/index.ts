@@ -62,6 +62,12 @@ const DEFAULT_TRANSPARENCY_FEATHER = process.env
   .NANO_BANANA_TRANSPARENCY_FEATHER
   ? Number(process.env.NANO_BANANA_TRANSPARENCY_FEATHER)
   : 6;
+const RAW_OPAQUE_BACKGROUND_COLOR =
+  process.env.NANO_BANANA_OPAQUE_BACKGROUND_COLOR;
+const DEFAULT_OPAQUE_BACKGROUND_COLOR =
+  RAW_OPAQUE_BACKGROUND_COLOR === undefined
+    ? "auto"
+    : RAW_OPAQUE_BACKGROUND_COLOR.trim();
 const DEFAULT_PROGRESS_INTERVAL_MS = 20000;
 const PROGRESS_INTERVAL_MS = resolveProgressIntervalMs();
 
@@ -89,6 +95,7 @@ type ToolArgs = {
   referenceImageUris?: ReferenceImageUri[];
   referenceImagePaths?: ReferenceImagePath[];
   transparencyKeyColor?: string;
+  opaqueBackgroundColor?: string;
   aspectRatio?: string;
   imageSize?: string;
   includeText?: boolean;
@@ -165,6 +172,10 @@ type ProgressReporter = {
   report: (message?: string) => void;
   startHeartbeat: (message: string) => () => void;
 };
+
+type OpaqueBackgroundSetting =
+  | { mode: "auto" }
+  | { mode: "fixed"; color: { r: number; g: number; b: number }; raw: string };
 
 function extensionForMimeType(mimeType: string): string {
   switch (mimeType) {
@@ -281,6 +292,72 @@ function formatHexColor(color: { r: number; g: number; b: number }): string {
   const toHex = (value: number) =>
     clampByte(value).toString(16).padStart(2, "0");
   return `#${toHex(color.r)}${toHex(color.g)}${toHex(color.b)}`;
+}
+
+function resolveOpaqueBackgroundSetting(
+  value?: string
+): OpaqueBackgroundSetting | null {
+  const raw =
+    value !== undefined
+      ? value.trim()
+      : DEFAULT_OPAQUE_BACKGROUND_COLOR?.trim();
+  if (!raw) {
+    return null;
+  }
+  const normalized = raw.toLowerCase();
+  if (
+    normalized === "off" ||
+    normalized === "none" ||
+    normalized === "false" ||
+    normalized === "no" ||
+    normalized === "disable" ||
+    normalized === "disabled"
+  ) {
+    return null;
+  }
+  if (normalized === "auto") {
+    return { mode: "auto" };
+  }
+  return { mode: "fixed", color: parseHexColor(raw), raw };
+}
+
+async function sampleTopLeftColor(buffer: Buffer) {
+  const { data } = await sharp(buffer, { failOnError: false })
+    .ensureAlpha()
+    .extract({ left: 0, top: 0, width: 1, height: 1 })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  return { r: data[0], g: data[1], b: data[2] };
+}
+
+async function resolveOpaqueBackgroundColor(
+  setting: OpaqueBackgroundSetting,
+  buffer: Buffer
+): Promise<{ r: number; g: number; b: number }> {
+  if (setting.mode === "fixed") {
+    return setting.color;
+  }
+  return sampleTopLeftColor(buffer);
+}
+
+async function flattenToOpaque(options: {
+  buffer: Buffer;
+  mimeType: string;
+  background: { r: number; g: number; b: number };
+}) {
+  if (options.mimeType === "image/jpeg") {
+    return options.buffer;
+  }
+
+  const pipeline = sharp(options.buffer, { failOnError: false }).flatten({
+    background: options.background,
+  });
+
+  if (options.mimeType === "image/webp") {
+    return pipeline.webp().toBuffer();
+  }
+
+  return pipeline.png().toBuffer();
 }
 
 function shouldAutoTransparent(prompt?: string): boolean {
@@ -1124,6 +1201,9 @@ async function handleGenerateImage(
     progress?.report("Requesting image generation.");
     const result = await generateImage(args);
     const { images, texts } = extractImagesAndTexts(result.response);
+    const opaqueSetting = resolveOpaqueBackgroundSetting(
+      args.opaqueBackgroundColor
+    );
 
     const content: Array<{ type: "text"; text: string }> = [];
 
@@ -1149,10 +1229,28 @@ async function handleGenerateImage(
 
     if (images.length > 0) {
       progress?.report("Persisting generated images.");
-      const outputImages = images.map((image) => ({
-        mimeType: image.mimeType,
-        data: Buffer.from(normalizeBase64(image.data), "base64"),
-      }));
+      const outputImages = await Promise.all(
+        images.map(async (image) => {
+          const rawBuffer = Buffer.from(
+            normalizeBase64(image.data),
+            "base64"
+          );
+          if (!opaqueSetting) {
+            return { mimeType: image.mimeType, data: rawBuffer };
+          }
+
+          const background = await resolveOpaqueBackgroundColor(
+            opaqueSetting,
+            rawBuffer
+          );
+          const data = await flattenToOpaque({
+            buffer: rawBuffer,
+            mimeType: image.mimeType,
+            background,
+          });
+          return { mimeType: image.mimeType, data };
+        })
+      );
       const outputBucket = resolveOutputGcsBucket(args);
       const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
         await persistOutputImages({
@@ -1686,6 +1784,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               "Hex key color for auto-transparency (used when prompt requests transparency).",
             default: DEFAULT_TRANSPARENCY_KEY_COLOR,
+          },
+          opaqueBackgroundColor: {
+            type: "string",
+            description:
+              "Hex color (or 'auto') to flatten outputs and remove alpha when transparency is not requested. Use 'off' to keep alpha.",
+            ...(DEFAULT_OPAQUE_BACKGROUND_COLOR
+              ? { default: DEFAULT_OPAQUE_BACKGROUND_COLOR }
+              : {}),
           },
           referenceImages: {
             type: "array",
