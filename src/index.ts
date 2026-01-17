@@ -1,5 +1,6 @@
 import "dotenv/config";
 
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolResult,
   type ServerNotification,
   type ServerRequest,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -72,6 +74,8 @@ const DEFAULT_PROGRESS_INTERVAL_MS = 20000;
 const DEFAULT_AUTO_TASK_4K = resolveAutoTask4k();
 const DEFAULT_AUTO_TASK_TTL_MS = resolveAutoTaskTtlMs();
 const PROGRESS_INTERVAL_MS = resolveProgressIntervalMs();
+const pollingTasks = new Map<string, PollingTask>();
+const pollingTaskTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 type ReferenceImage = {
   mimeType: string;
@@ -150,6 +154,10 @@ type MakeTransparentArgs = {
   imglyDebug?: boolean;
 };
 
+type PollingTaskArgs = {
+  taskId: string;
+};
+
 type ServiceAccount = {
   client_email?: string;
   private_key?: string;
@@ -179,6 +187,16 @@ type OpaqueBackgroundSetting =
   | { mode: "auto" }
   | { mode: "fixed"; color: { r: number; g: number; b: number }; raw: string };
 
+type PollingTaskStatus = "queued" | "working" | "completed" | "failed";
+
+type PollingTask = {
+  taskId: string;
+  status: PollingTaskStatus;
+  createdAt: number;
+  expiresAt?: number;
+  result?: CallToolResult;
+};
+
 function extensionForMimeType(mimeType: string): string {
   switch (mimeType) {
     case "image/jpeg":
@@ -193,6 +211,62 @@ function extensionForMimeType(mimeType: string): string {
 
 let cachedServiceAccount: ServiceAccount | null = null;
 let cachedAuthClient: ReturnType<GoogleAuth["getClient"]> | null = null;
+
+function buildErrorResult(message: string): CallToolResult {
+  return {
+    content: [{ type: "text", text: `Nano Banana error: ${message}` }],
+    isError: true,
+  };
+}
+
+function clearPollingTaskTimer(taskId: string) {
+  const timer = pollingTaskTimers.get(taskId);
+  if (timer) {
+    clearTimeout(timer);
+    pollingTaskTimers.delete(taskId);
+  }
+}
+
+function schedulePollingTaskCleanup(task: PollingTask) {
+  if (DEFAULT_AUTO_TASK_TTL_MS === null) {
+    return;
+  }
+  clearPollingTaskTimer(task.taskId);
+  task.expiresAt = Date.now() + DEFAULT_AUTO_TASK_TTL_MS;
+  const timer = setTimeout(() => {
+    pollingTasks.delete(task.taskId);
+    pollingTaskTimers.delete(task.taskId);
+  }, DEFAULT_AUTO_TASK_TTL_MS);
+  pollingTaskTimers.set(task.taskId, timer);
+}
+
+function createPollingTask(): PollingTask {
+  const task: PollingTask = {
+    taskId: randomUUID(),
+    status: "queued",
+    createdAt: Date.now(),
+  };
+  pollingTasks.set(task.taskId, task);
+  return task;
+}
+
+function setPollingTaskStatus(taskId: string, status: PollingTaskStatus) {
+  const task = pollingTasks.get(taskId);
+  if (!task) {
+    return;
+  }
+  task.status = status;
+}
+
+function storePollingTaskResult(taskId: string, result: CallToolResult) {
+  const task = pollingTasks.get(taskId);
+  if (!task) {
+    return;
+  }
+  task.status = result.isError ? "failed" : "completed";
+  task.result = result;
+  schedulePollingTaskCleanup(task);
+}
 
 function normalizeBase64(data: string): string {
   const trimmed = data.trim();
@@ -469,7 +543,7 @@ function resolveProgressIntervalMs(): number {
 function resolveAutoTask4k(): boolean {
   const raw = process.env.NANO_BANANA_AUTO_TASK_4K;
   if (!raw) {
-    return true;
+    return false;
   }
   const normalized = raw.trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(normalized)) {
@@ -478,7 +552,7 @@ function resolveAutoTask4k(): boolean {
   if (["0", "false", "no", "off"].includes(normalized)) {
     return false;
   }
-  return true;
+  return false;
 }
 
 function resolveAutoTaskTtlMs(): number | null {
@@ -1242,7 +1316,7 @@ async function generateImage(args: ToolArgs): Promise<{
 async function handleGenerateImage(
   args: ToolArgs,
   progress?: ProgressReporter | null
-) {
+): Promise<CallToolResult> {
   const stopHeartbeat = progress?.startHeartbeat("Generating image...");
   try {
     if (shouldAutoTransparent(args.prompt)) {
@@ -1353,7 +1427,7 @@ async function handleGenerateImage(
 async function handleGenerateImageWithTransparency(
   args: ToolArgs,
   progress?: ProgressReporter | null
-) {
+): Promise<CallToolResult> {
   const content: Array<{ type: "text"; text: string }> = [];
   try {
     const keyColor =
@@ -1460,7 +1534,7 @@ async function handleGenerateImageWithTransparency(
 async function handleMakeTransparent(
   args: MakeTransparentArgs,
   progress?: ProgressReporter | null
-) {
+): Promise<CallToolResult> {
   const method: TransparentMethod = args.method ?? "imgly";
   const heartbeatMessage =
     method === "gemini"
@@ -1791,6 +1865,48 @@ async function handleMakeTransparent(
   }
 }
 
+async function handleGetPollingTask(
+  args: PollingTaskArgs
+): Promise<CallToolResult> {
+  const taskId = args.taskId?.trim();
+  if (!taskId) {
+    return buildErrorResult("taskId is required.");
+  }
+
+  const task = pollingTasks.get(taskId);
+  if (!task) {
+    return buildErrorResult(`Task ${taskId} not found.`);
+  }
+
+  const structuredContent: Record<string, string> = {
+    taskId,
+    status: task.status,
+  };
+  if (task.expiresAt) {
+    structuredContent.expiresAt = new Date(task.expiresAt).toISOString();
+  }
+
+  if (task.status === "completed" || task.status === "failed") {
+    const result =
+      task.result ??
+      buildErrorResult(`Task ${taskId} ${task.status} with no result.`);
+    return {
+      ...result,
+      structuredContent,
+    };
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Task ${taskId} status: ${task.status}.`,
+      },
+    ],
+    structuredContent,
+  };
+}
+
 const taskStore = new InMemoryTaskStore();
 const taskMessageQueue = new InMemoryTaskMessageQueue();
 
@@ -1822,7 +1938,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_generate_image",
       description:
-        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server will render on a key color and return a true transparent PNG automatically. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a task immediately to avoid client timeouts.",
+        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server will render on a key color and return a true transparent PNG automatically. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a polling task (or MCP task when explicitly requested) when auto-task mode is enabled to avoid client timeouts.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1998,6 +2114,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Optional filename prefix used for GCS object names and local files.",
+          },
+        },
+      },
+    },
+    {
+      name: "nano_banana_get_task",
+      description:
+        "Get status/results for polling tasks returned by nano_banana_generate_image when auto-task is enabled.",
+      inputSchema: {
+        type: "object",
+        required: ["taskId"],
+        properties: {
+          taskId: {
+            type: "string",
+            description: "Task ID returned by nano_banana_generate_image.",
           },
         },
       },
@@ -2190,24 +2321,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       request.params.arguments as ToolArgs
     );
 
-  const runTool = async () => {
+  const runTool = async (
+    progressOverride: ProgressReporter | null = progress
+  ): Promise<CallToolResult> => {
     switch (request.params.name) {
       case "nano_banana_generate_image":
         return handleGenerateImage(
           request.params.arguments as ToolArgs,
-          progress
+          progressOverride
+        );
+      case "nano_banana_get_task":
+        return handleGetPollingTask(
+          request.params.arguments as PollingTaskArgs
         );
       case "nano_banana_make_transparent":
         return handleMakeTransparent(
           request.params.arguments as MakeTransparentArgs,
-          progress
+          progressOverride
         );
       default:
         throw new Error(`Unknown tool: ${request.params.name}`);
     }
   };
 
-  if (taskParams || autoTask) {
+  if (taskParams) {
     if (!extra.taskStore) {
       throw new Error(
         "Task requests are not supported because no task store is configured."
@@ -2226,13 +2363,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await extra.taskStore?.storeTaskResult(task.taskId, "failed", {
-          content: [{ type: "text", text: `Nano Banana error: ${message}` }],
-          isError: true,
+          ...buildErrorResult(message),
         });
       }
     })();
 
     return { task };
+  }
+
+  if (autoTask) {
+    const task = createPollingTask();
+    void (async () => {
+      try {
+        setPollingTaskStatus(task.taskId, "working");
+        const result = await runTool(null);
+        storePollingTaskResult(task.taskId, result);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        storePollingTaskResult(task.taskId, buildErrorResult(message));
+      }
+    })();
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Task ${task.taskId} queued. Poll with nano_banana_get_task.`,
+        },
+      ],
+      structuredContent: {
+        taskId: task.taskId,
+        status: task.status,
+      },
+    };
   }
 
   return runTool();
