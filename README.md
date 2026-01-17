@@ -175,6 +175,7 @@ const poll = await client.request(
 Notes:
 - Polling tasks are stored in memory and are cleared on server restart.
 - Polling tasks expire after `NANO_BANANA_AUTO_TASK_TTL_MS` (set `0` to disable expiry).
+- Completed polling responses include `structuredContent` with `outputImageUris`, `outputImageUrls`, and `savedPaths` when available.
 
 ## MCP tool
 

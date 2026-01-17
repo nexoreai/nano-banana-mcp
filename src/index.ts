@@ -219,6 +219,42 @@ function buildErrorResult(message: string): CallToolResult {
   };
 }
 
+function setIfNonEmpty(
+  target: Record<string, unknown>,
+  key: string,
+  value?: unknown
+) {
+  if (Array.isArray(value)) {
+    if (value.length > 0) {
+      target[key] = value;
+    }
+    return;
+  }
+  if (value !== undefined) {
+    target[key] = value;
+  }
+}
+
+function buildOutputStructuredContent(options: {
+  referenceImageUris?: string[];
+  outputImageUris?: string[];
+  outputImageUrls?: string[];
+  savedPaths?: string[];
+  inlineData?: string[];
+}) {
+  const structuredContent: Record<string, unknown> = {};
+  setIfNonEmpty(
+    structuredContent,
+    "referenceImageUris",
+    options.referenceImageUris
+  );
+  setIfNonEmpty(structuredContent, "outputImageUris", options.outputImageUris);
+  setIfNonEmpty(structuredContent, "outputImageUrls", options.outputImageUrls);
+  setIfNonEmpty(structuredContent, "savedPaths", options.savedPaths);
+  setIfNonEmpty(structuredContent, "inlineData", options.inlineData);
+  return structuredContent;
+}
+
 function clearPollingTaskTimer(taskId: string) {
   const timer = pollingTaskTimers.get(taskId);
   if (timer) {
@@ -1331,6 +1367,9 @@ async function handleGenerateImage(
     );
 
     const content: Array<{ type: "text"; text: string }> = [];
+    const structuredContent = buildOutputStructuredContent({
+      referenceImageUris: result.uploadedUris,
+    });
 
     content.push({
       type: "text",
@@ -1403,6 +1442,15 @@ async function handleGenerateImage(
         type: "text",
         text: `Saved ${savedPaths.length} image(s) to:\n${savedPaths.join("\n")}`,
       });
+
+      Object.assign(
+        structuredContent,
+        buildOutputStructuredContent({
+          outputImageUris: uploadedOutputUris,
+          outputImageUrls: uploadedOutputUrls,
+          savedPaths,
+        })
+      );
     }
 
     if (images.length === 0 && texts.length > 0) {
@@ -1412,7 +1460,9 @@ async function handleGenerateImage(
       });
     }
 
-    return { content };
+    return Object.keys(structuredContent).length
+      ? { content, structuredContent }
+      : { content };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -1444,6 +1494,9 @@ async function handleGenerateImageWithTransparency(
     };
     const result = await generateImage(generateArgs);
     const { images, texts } = extractImagesAndTexts(result.response);
+    const structuredContent = buildOutputStructuredContent({
+      referenceImageUris: result.uploadedUris,
+    });
 
     content.push({
       type: "text",
@@ -1512,6 +1565,15 @@ async function handleGenerateImageWithTransparency(
         type: "text",
         text: `Saved ${savedPaths.length} image(s) to:\n${savedPaths.join("\n")}`,
       });
+
+      Object.assign(
+        structuredContent,
+        buildOutputStructuredContent({
+          outputImageUris: uploadedOutputUris,
+          outputImageUrls: uploadedOutputUrls,
+          savedPaths,
+        })
+      );
     }
 
     if (images.length === 0 && texts.length > 0) {
@@ -1521,7 +1583,9 @@ async function handleGenerateImageWithTransparency(
       });
     }
 
-    return { content };
+    return Object.keys(structuredContent).length
+      ? { content, structuredContent }
+      : { content };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -1543,6 +1607,7 @@ async function handleMakeTransparent(
   const stopHeartbeat = progress?.startHeartbeat(heartbeatMessage);
   try {
     const content: Array<{ type: "text"; text: string }> = [];
+    const structuredContent: Record<string, unknown> = {};
 
     if (method === "gemini") {
       progress?.report("Requesting transparency via Gemini.");
@@ -1597,16 +1662,29 @@ async function handleMakeTransparent(
           text: `Saved ${savedPaths.length} image(s) to:\n${savedPaths.join("\n")}`,
         });
 
+        const inlineData = args.returnInlineData
+          ? images.map((image) => {
+              const base64 = normalizeBase64(image.data);
+              return `data:${image.mimeType};base64,${base64}`;
+            })
+          : [];
+
         if (args.returnInlineData) {
-          const inlineData = images.map((image) => {
-            const base64 = normalizeBase64(image.data);
-            return `data:${image.mimeType};base64,${base64}`;
-          });
           content.push({
             type: "text",
             text: `Inline data:\n${inlineData.join("\n")}`,
           });
         }
+
+        Object.assign(
+          structuredContent,
+          buildOutputStructuredContent({
+            outputImageUris: uploadedOutputUris,
+            outputImageUrls: uploadedOutputUrls,
+            savedPaths,
+            inlineData,
+          })
+        );
       }
 
       if (images.length === 0 && texts.length > 0) {
@@ -1616,7 +1694,9 @@ async function handleMakeTransparent(
         });
       }
 
-      return { content };
+      return Object.keys(structuredContent).length
+        ? { content, structuredContent }
+        : { content };
     }
 
     if (method === "imgly") {
@@ -1714,7 +1794,27 @@ async function handleMakeTransparent(
         });
       }
 
-      return { content };
+      Object.assign(
+        structuredContent,
+        buildOutputStructuredContent({
+          outputImageUris: uploadedOutputUris,
+          outputImageUrls: uploadedOutputUrls,
+          savedPaths,
+          ...(args.returnInlineData
+            ? {
+                inlineData: [
+                  `data:${outputFormat};base64,${outputBuffer.toString(
+                    "base64"
+                  )}`,
+                ],
+              }
+            : {}),
+        })
+      );
+
+      return Object.keys(structuredContent).length
+        ? { content, structuredContent }
+        : { content };
     }
 
     if (method === "color-key") {
@@ -1775,7 +1875,25 @@ async function handleMakeTransparent(
         });
       }
 
-      return { content };
+      Object.assign(
+        structuredContent,
+        buildOutputStructuredContent({
+          outputImageUris: uploadedOutputUris,
+          outputImageUrls: uploadedOutputUrls,
+          savedPaths,
+          ...(args.returnInlineData
+            ? {
+                inlineData: [
+                  `data:image/png;base64,${outputBuffer.toString("base64")}`,
+                ],
+              }
+            : {}),
+        })
+      );
+
+      return Object.keys(structuredContent).length
+        ? { content, structuredContent }
+        : { content };
     }
 
     if (method === "checkerboard") {
@@ -1850,7 +1968,25 @@ async function handleMakeTransparent(
         });
       }
 
-      return { content };
+      Object.assign(
+        structuredContent,
+        buildOutputStructuredContent({
+          outputImageUris: uploadedOutputUris,
+          outputImageUrls: uploadedOutputUrls,
+          savedPaths,
+          ...(args.returnInlineData
+            ? {
+                inlineData: [
+                  `data:image/png;base64,${outputBuffer.toString("base64")}`,
+                ],
+              }
+            : {}),
+        })
+      );
+
+      return Object.keys(structuredContent).length
+        ? { content, structuredContent }
+        : { content };
     }
 
     throw new Error(`Unsupported method "${method}".`);
@@ -1878,12 +2014,12 @@ async function handleGetPollingTask(
     return buildErrorResult(`Task ${taskId} not found.`);
   }
 
-  const structuredContent: Record<string, string> = {
+  const structuredContent: Record<string, unknown> = {
     taskId,
-    status: task.status,
+    taskStatus: task.status,
   };
   if (task.expiresAt) {
-    structuredContent.expiresAt = new Date(task.expiresAt).toISOString();
+    structuredContent.taskExpiresAt = new Date(task.expiresAt).toISOString();
   }
 
   if (task.status === "completed" || task.status === "failed") {
@@ -1892,7 +2028,10 @@ async function handleGetPollingTask(
       buildErrorResult(`Task ${taskId} ${task.status} with no result.`);
     return {
       ...result,
-      structuredContent,
+      structuredContent: {
+        ...(result.structuredContent ?? {}),
+        ...structuredContent,
+      },
     };
   }
 
@@ -2394,7 +2533,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       ],
       structuredContent: {
         taskId: task.taskId,
-        status: task.status,
+        taskStatus: task.status,
       },
     };
   }
