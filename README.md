@@ -176,6 +176,7 @@ Notes:
 - Polling tasks are stored in memory and are cleared on server restart.
 - Polling tasks expire after `NANO_BANANA_AUTO_TASK_TTL_MS` (set `0` to disable expiry).
 - Completed polling responses include `structuredContent` with `outputImageUris`, `outputImageUrls`, and `savedPaths` when available.
+- Wait a few seconds between `nano_banana_get_task` polls to avoid hammering the server.
 
 ## MCP tool
 
