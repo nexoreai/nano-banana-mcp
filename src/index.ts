@@ -43,7 +43,7 @@ const DEFAULT_OUTPUT_DIR =
   process.env.NANO_BANANA_OUTPUT_DIR ??
   path.join(os.homedir(), "nano-banana-outputs");
 const DEFAULT_TRANSPARENT_PROMPT =
-  "Remove the background and make it transparent. Keep the main subject unchanged. Output a transparent PNG.";
+  "Remove the background and make it transparent. Keep the main subject unchanged. Output a transparent PNG with an alpha channel. Do not render a checkerboard or any background pattern.";
 const DEFAULT_IMGLY_MODEL =
   process.env.NANO_BANANA_IMGLY_MODEL?.trim() || "medium";
 const DEFAULT_IMGLY_OUTPUT_FORMAT =
@@ -54,16 +54,6 @@ const DEFAULT_IMGLY_OUTPUT_QUALITY = process.env
   .NANO_BANANA_IMGLY_OUTPUT_QUALITY
   ? Number(process.env.NANO_BANANA_IMGLY_OUTPUT_QUALITY)
   : undefined;
-const DEFAULT_TRANSPARENCY_KEY_COLOR =
-  process.env.NANO_BANANA_TRANSPARENCY_KEY_COLOR?.trim() || "#00ff00";
-const DEFAULT_TRANSPARENCY_TOLERANCE = process.env
-  .NANO_BANANA_TRANSPARENCY_TOLERANCE
-  ? Number(process.env.NANO_BANANA_TRANSPARENCY_TOLERANCE)
-  : undefined;
-const DEFAULT_TRANSPARENCY_FEATHER = process.env
-  .NANO_BANANA_TRANSPARENCY_FEATHER
-  ? Number(process.env.NANO_BANANA_TRANSPARENCY_FEATHER)
-  : 6;
 const RAW_OPAQUE_BACKGROUND_COLOR =
   process.env.NANO_BANANA_OPAQUE_BACKGROUND_COLOR;
 const DEFAULT_OPAQUE_BACKGROUND_COLOR =
@@ -100,7 +90,6 @@ type ToolArgs = {
   referenceImages?: ReferenceImage[];
   referenceImageUris?: ReferenceImageUri[];
   referenceImagePaths?: ReferenceImagePath[];
-  transparencyKeyColor?: string;
   opaqueBackgroundColor?: string;
   aspectRatio?: string;
   imageSize?: string;
@@ -126,15 +115,12 @@ type SourceImageInput = {
   displayName?: string;
 };
 
-type TransparentMethod = "gemini" | "color-key" | "checkerboard" | "imgly";
+type TransparentMethod = "gemini" | "imgly";
 
 type MakeTransparentArgs = {
   sourceImage: SourceImageInput;
   method?: TransparentMethod;
   prompt?: string;
-  color?: string;
-  tolerance?: number;
-  feather?: number;
   returnInlineData?: boolean;
   skipGcsUpload?: boolean;
   includeText?: boolean;
@@ -355,16 +341,6 @@ function inferMimeTypeFromUri(fileUri: string): string | null {
   return inferMimeTypeFromPath(filename);
 }
 
-function clampByte(value: number): number {
-  if (value < 0) {
-    return 0;
-  }
-  if (value > 255) {
-    return 255;
-  }
-  return Math.round(value);
-}
-
 function parseHexColor(input: string): { r: number; g: number; b: number } {
   const trimmed = input.trim();
   const hex = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
@@ -398,12 +374,6 @@ function parseGcsUri(fileUri: string): { bucket: string; objectName: string } {
     throw new Error(`Invalid GCS URI: ${fileUri}`);
   }
   return { bucket, objectName };
-}
-
-function formatHexColor(color: { r: number; g: number; b: number }): string {
-  const toHex = (value: number) =>
-    clampByte(value).toString(16).padStart(2, "0");
-  return `#${toHex(color.r)}${toHex(color.g)}${toHex(color.b)}`;
 }
 
 function resolveOpaqueBackgroundSetting(
@@ -490,16 +460,73 @@ function shouldAutoTransparent(prompt?: string): boolean {
   return explicitTransparent;
 }
 
-function buildTransparencyPrompt(originalPrompt: string, keyColor: string) {
+function buildNaturalTransparencyPrompt(originalPrompt: string) {
+  const trimmed = originalPrompt.trim();
+  if (!trimmed) {
+    return "Generate an image with a transparent background. Output a PNG with an alpha channel. Do not render a checkerboard, grid, or any background pattern.";
+  }
   return [
-    originalPrompt.trim(),
+    trimmed,
     "",
-    `IMPORTANT: Render on a perfectly flat, solid background color ${keyColor} (exact hex).`,
-    "No gradients, no textures, no shadows, no glow, no transparency.",
-    `Do not use ${keyColor} anywhere in the subject.`,
-    "Keep the subject fully opaque with crisp, clean edges.",
-    "Leave a small margin around the subject.",
+    "Background must be transparent (alpha). Output a PNG with a transparent background. Do not render a checkerboard, grid, or any background pattern.",
   ].join("\n");
+}
+
+async function hasTransparentPixels(buffer: Buffer): Promise<boolean> {
+  const { data } = await sharp(buffer, { failOnError: false })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] < 255) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function removeBackgroundWithImgly(options: {
+  buffer: Buffer;
+  mimeType: string;
+}) {
+  const outputFormatCandidate = DEFAULT_IMGLY_OUTPUT_FORMAT;
+  const outputFormat =
+    outputFormatCandidate === "image/webp" || outputFormatCandidate === "image/png"
+      ? outputFormatCandidate
+      : "image/png";
+  const modelCandidate = DEFAULT_IMGLY_MODEL;
+  const model =
+    modelCandidate === "small" ||
+    modelCandidate === "medium" ||
+    modelCandidate === "large"
+      ? modelCandidate
+      : "medium";
+  const publicPath = DEFAULT_IMGLY_PUBLIC_PATH;
+  const quality =
+    typeof DEFAULT_IMGLY_OUTPUT_QUALITY === "number"
+      ? DEFAULT_IMGLY_OUTPUT_QUALITY
+      : undefined;
+
+  const config: ImglyConfig = {
+    model,
+    output: {
+      format: outputFormat,
+      ...(typeof quality === "number" ? { quality } : {}),
+    },
+    ...(publicPath ? { publicPath } : {}),
+  };
+
+  const inputBlob = new Blob([new Uint8Array(options.buffer)], {
+    type: options.mimeType,
+  });
+  const blob = await removeBackground(inputBlob, config);
+  const outputBuffer = Buffer.from(await blob.arrayBuffer());
+
+  return {
+    buffer: outputBuffer,
+    mimeType: outputFormat,
+    model,
+  };
 }
 
 async function loadServiceAccount(): Promise<ServiceAccount> {
@@ -882,269 +909,6 @@ function extractImagesAndTexts(response: GenerateContentResponse) {
   return { images, texts };
 }
 
-async function applyColorKeyTransparency(options: {
-  buffer: Buffer;
-  color?: { r: number; g: number; b: number };
-  tolerance?: number;
-  feather?: number;
-}): Promise<Buffer> {
-  const image = sharp(options.buffer, { failOnError: false });
-  const { data, info } = await image
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  const baseColor = options.color ?? {
-    r: data[0],
-    g: data[1],
-    b: data[2],
-  };
-
-  return applyMultiColorKeyToRaw({
-    data,
-    info,
-    colors: [baseColor],
-    tolerance: options.tolerance,
-    feather: options.feather,
-  });
-}
-
-function detectCheckerboardColorsFromBorder(
-  data: Buffer,
-  info: { width: number; height: number; channels: number },
-  options?: {
-    sampleStep?: number;
-    quantizeStep?: number;
-    maxColors?: number;
-  }
-) {
-  const width = info.width;
-  const height = info.height;
-  const channels = info.channels;
-  const sampleStep =
-    options?.sampleStep ??
-    Math.max(1, Math.round(Math.min(width, height) / 64));
-  const quantizeStep = Math.max(1, options?.quantizeStep ?? 8);
-  const maxColors = Math.max(1, options?.maxColors ?? 2);
-  const samples: Array<{ r: number; g: number; b: number }> = [];
-  const counts = new Map<
-    string,
-    { r: number; g: number; b: number; count: number }
-  >();
-  let sampleCount = 0;
-
-  const addSample = (r: number, g: number, b: number) => {
-    samples.push({ r, g, b });
-    const qr = clampByte(Math.round(r / quantizeStep) * quantizeStep);
-    const qg = clampByte(Math.round(g / quantizeStep) * quantizeStep);
-    const qb = clampByte(Math.round(b / quantizeStep) * quantizeStep);
-    const key = `${qr},${qg},${qb}`;
-    const existing = counts.get(key);
-    if (existing) {
-      existing.count += 1;
-    } else {
-      counts.set(key, { r: qr, g: qg, b: qb, count: 1 });
-    }
-    sampleCount += 1;
-  };
-
-  const index = (x: number, y: number) => (y * width + x) * channels;
-
-  for (let x = 0; x < width; x += sampleStep) {
-    let idx = index(x, 0);
-    addSample(data[idx], data[idx + 1], data[idx + 2]);
-    idx = index(x, height - 1);
-    addSample(data[idx], data[idx + 1], data[idx + 2]);
-  }
-
-  for (let y = 0; y < height; y += sampleStep) {
-    let idx = index(0, y);
-    addSample(data[idx], data[idx + 1], data[idx + 2]);
-    idx = index(width - 1, y);
-    addSample(data[idx], data[idx + 1], data[idx + 2]);
-  }
-
-  const sorted = Array.from(counts.values()).sort(
-    (a, b) => b.count - a.count
-  );
-  const colors = sorted
-    .slice(0, maxColors)
-    .map((entry) => ({ r: entry.r, g: entry.g, b: entry.b }));
-  const topSamples = sorted
-    .slice(0, maxColors)
-    .reduce((sum, entry) => sum + entry.count, 0);
-  const coverage = sampleCount > 0 ? topSamples / sampleCount : 0;
-
-  return { colors, sampleCount, coverage, samples };
-}
-
-async function applyAutoKeyTransparency(options: {
-  buffer: Buffer;
-  fallbackColor?: { r: number; g: number; b: number };
-  tolerance?: number;
-  feather?: number;
-  sampleStep?: number;
-  quantizeStep?: number;
-  maxColors?: number;
-}): Promise<{
-  outputBuffer: Buffer;
-  colors: Array<{ r: number; g: number; b: number }>;
-  coverage: number;
-  usedFallback: boolean;
-}> {
-  const image = sharp(options.buffer, { failOnError: false });
-  const { data, info } = await image
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  const { colors, coverage, samples } = detectCheckerboardColorsFromBorder(
-    data,
-    info,
-    {
-      sampleStep: options.sampleStep,
-      quantizeStep: options.quantizeStep,
-      maxColors: options.maxColors,
-    }
-  );
-
-  let selectedColors = colors;
-  let usedFallback = false;
-  if (coverage < 0.5 || selectedColors.length === 0) {
-    if (options.fallbackColor) {
-      selectedColors = [options.fallbackColor];
-      usedFallback = true;
-    } else {
-      throw new Error("Failed to detect background colors for transparency.");
-    }
-  }
-
-  let tolerance = options.tolerance;
-  if (typeof tolerance !== "number") {
-    const distances = samples.map((sample) => {
-      let minDistSq = Number.POSITIVE_INFINITY;
-      for (const color of selectedColors) {
-        const dr = sample.r - color.r;
-        const dg = sample.g - color.g;
-        const db = sample.b - color.b;
-        const distSq = dr * dr + dg * dg + db * db;
-        if (distSq < minDistSq) {
-          minDistSq = distSq;
-        }
-      }
-      return minDistSq;
-    });
-    distances.sort((a, b) => a - b);
-    const percentileIndex = Math.floor(distances.length * 0.9);
-    const percentile =
-      distances.length > 0 ? distances[percentileIndex] : 0;
-    tolerance = clampByte(Math.ceil(Math.sqrt(percentile)) + 6);
-  }
-
-  const outputBuffer = await applyMultiColorKeyToRaw({
-    data,
-    info,
-    colors: selectedColors,
-    tolerance,
-    feather: options.feather,
-  });
-
-  return { outputBuffer, colors: selectedColors, coverage, usedFallback };
-}
-
-async function applyMultiColorKeyToRaw(options: {
-  data: Buffer;
-  info: { width: number; height: number; channels: number };
-  colors: Array<{ r: number; g: number; b: number }>;
-  tolerance?: number;
-  feather?: number;
-}): Promise<Buffer> {
-  if (options.colors.length === 0) {
-    throw new Error("No background colors detected for transparency.");
-  }
-
-  const tolerance = clampByte(options.tolerance ?? 12);
-  const feather = clampByte(options.feather ?? 0);
-  const toleranceSq = tolerance * tolerance;
-  const featherLimit = tolerance + feather;
-  const featherLimitSq = featherLimit * featherLimit;
-
-  const data = options.data;
-  const channels = options.info.channels;
-
-  for (let i = 0; i < data.length; i += channels) {
-    let minDistSq = Number.POSITIVE_INFINITY;
-    for (const color of options.colors) {
-      const dr = data[i] - color.r;
-      const dg = data[i + 1] - color.g;
-      const db = data[i + 2] - color.b;
-      const distSq = dr * dr + dg * dg + db * db;
-      if (distSq < minDistSq) {
-        minDistSq = distSq;
-      }
-    }
-
-    const originalAlpha = data[i + 3];
-    let alphaFactor = 1;
-    if (minDistSq <= toleranceSq) {
-      alphaFactor = 0;
-    } else if (feather > 0 && minDistSq < featherLimitSq) {
-      const dist = Math.sqrt(minDistSq);
-      alphaFactor = (dist - tolerance) / feather;
-    }
-
-    data[i + 3] = clampByte(originalAlpha * alphaFactor);
-  }
-
-  const rawChannels = options.info.channels as 1 | 2 | 3 | 4;
-  return sharp(data, {
-    raw: {
-      width: options.info.width,
-      height: options.info.height,
-      channels: rawChannels,
-    },
-  })
-    .png()
-    .toBuffer();
-}
-
-async function applyCheckerboardTransparency(options: {
-  buffer: Buffer;
-  tolerance?: number;
-  feather?: number;
-  sampleStep?: number;
-  quantizeStep?: number;
-  maxColors?: number;
-}): Promise<{
-  outputBuffer: Buffer;
-  colors: Array<{ r: number; g: number; b: number }>;
-  coverage: number;
-}> {
-  const image = sharp(options.buffer, { failOnError: false });
-  const { data, info } = await image
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  const { colors, coverage } = detectCheckerboardColorsFromBorder(
-    data,
-    info,
-    {
-      sampleStep: options.sampleStep,
-      quantizeStep: options.quantizeStep,
-      maxColors: options.maxColors,
-    }
-  );
-
-  const outputBuffer = await applyMultiColorKeyToRaw({
-    data,
-    info,
-    colors,
-    tolerance: options.tolerance,
-    feather: options.feather,
-  });
-
-  return { outputBuffer, colors, coverage };
-}
-
 async function persistOutputImages(options: {
   images: Array<{ mimeType: string; data: Buffer }>;
   outputFilePrefix?: string;
@@ -1480,14 +1244,11 @@ async function handleGenerateImageWithTransparency(
 ): Promise<CallToolResult> {
   const content: Array<{ type: "text"; text: string }> = [];
   try {
-    const keyColor =
-      args.transparencyKeyColor?.trim() || DEFAULT_TRANSPARENCY_KEY_COLOR;
-    const transparencyPrompt = buildTransparencyPrompt(
-      args.prompt ?? "",
-      keyColor
+    const transparencyPrompt = buildNaturalTransparencyPrompt(
+      args.prompt ?? ""
     );
 
-    progress?.report("Requesting transparency-ready image.");
+    progress?.report("Requesting transparent image.");
     const generateArgs: ToolArgs = {
       ...args,
       prompt: transparencyPrompt,
@@ -1500,7 +1261,7 @@ async function handleGenerateImageWithTransparency(
 
     content.push({
       type: "text",
-      text: `Generated ${images.length} image(s) with transparency-ready background.`,
+      text: `Generated ${images.length} transparent image(s).`,
     });
 
     if (args.includeText && texts.length > 0) {
@@ -1517,27 +1278,26 @@ async function handleGenerateImageWithTransparency(
     }
 
     if (images.length > 0) {
-      progress?.report("Applying transparency.");
-      const parsedKeyColor = parseHexColor(keyColor);
-      const outputImages: Array<{ mimeType: string; data: Buffer }> = [];
+      progress?.report("Validating transparency.");
+      const outputImages = await Promise.all(
+        images.map(async (image, index) => {
+          const rawBuffer = Buffer.from(normalizeBase64(image.data), "base64");
+          const hasAlpha = await hasTransparentPixels(rawBuffer);
+          if (hasAlpha) {
+            return { mimeType: image.mimeType, data: rawBuffer };
+          }
+          progress?.report(
+            `No alpha detected in image ${index + 1}; removing background.`
+          );
+          const removed = await removeBackgroundWithImgly({
+            buffer: rawBuffer,
+            mimeType: image.mimeType,
+          });
+          return { mimeType: removed.mimeType, data: removed.buffer };
+        })
+      );
 
-      for (const image of images) {
-        const rawBuffer = Buffer.from(normalizeBase64(image.data), "base64");
-        const { outputBuffer } = await applyAutoKeyTransparency({
-          buffer: rawBuffer,
-          fallbackColor: parsedKeyColor,
-          tolerance: DEFAULT_TRANSPARENCY_TOLERANCE,
-          feather: DEFAULT_TRANSPARENCY_FEATHER,
-          sampleStep: 8,
-          quantizeStep: 6,
-          maxColors: 2,
-        });
-        outputImages.push({
-          mimeType: "image/png",
-          data: outputBuffer,
-        });
-      }
-
+      progress?.report("Persisting transparent outputs.");
       const outputBucket = resolveOutputGcsBucket(args);
       const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
         await persistOutputImages({
@@ -1817,178 +1577,6 @@ async function handleMakeTransparent(
         : { content };
     }
 
-    if (method === "color-key") {
-      progress?.report("Applying color-key transparency.");
-      const { buffer } = await resolveSourceImageBuffer(args.sourceImage);
-      const color = args.color ? parseHexColor(args.color) : undefined;
-      const outputBuffer = await applyColorKeyTransparency({
-        buffer,
-        color,
-        tolerance: args.tolerance,
-        feather: args.feather,
-      });
-      const outputImages = [
-        {
-          mimeType: "image/png",
-          data: outputBuffer,
-        },
-      ];
-      const outputBucket = resolveOutputGcsBucket(args);
-      const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
-        await persistOutputImages({
-          images: outputImages,
-          outputFilePrefix: args.outputFilePrefix,
-          outputGcsBucket: outputBucket,
-          outputGcsPrefix: args.outputGcsPrefix,
-          outputDir: args.outputDir,
-          requireGcsUpload: false,
-          skipGcsUpload: args.skipGcsUpload,
-        });
-
-      content.push({
-        type: "text",
-        text: "Generated 1 transparent image using color-key.",
-      });
-
-      if (uploadedOutputUris.length > 0) {
-        content.push({
-          type: "text",
-          text: `Uploaded 1 image to:\n${uploadedOutputUris.join("\n")}`,
-        });
-        content.push({
-          type: "text",
-          text: `HTTP URL(s) (requires bucket access):\n${uploadedOutputUrls.join(
-            "\n"
-          )}`,
-        });
-      }
-      content.push({
-        type: "text",
-        text: `Saved 1 image to:\n${savedPaths.join("\n")}`,
-      });
-
-      if (args.returnInlineData) {
-        const base64 = outputBuffer.toString("base64");
-        content.push({
-          type: "text",
-          text: `Inline data:\ndata:image/png;base64,${base64}`,
-        });
-      }
-
-      Object.assign(
-        structuredContent,
-        buildOutputStructuredContent({
-          outputImageUris: uploadedOutputUris,
-          outputImageUrls: uploadedOutputUrls,
-          savedPaths,
-          ...(args.returnInlineData
-            ? {
-                inlineData: [
-                  `data:image/png;base64,${outputBuffer.toString("base64")}`,
-                ],
-              }
-            : {}),
-        })
-      );
-
-      return Object.keys(structuredContent).length
-        ? { content, structuredContent }
-        : { content };
-    }
-
-    if (method === "checkerboard") {
-      progress?.report("Detecting checkerboard background.");
-      const { buffer } = await resolveSourceImageBuffer(args.sourceImage);
-      const { outputBuffer, colors, coverage } =
-        await applyCheckerboardTransparency({
-          buffer,
-          tolerance: args.tolerance,
-          feather: args.feather,
-        });
-      const outputImages = [
-        {
-          mimeType: "image/png",
-          data: outputBuffer,
-        },
-      ];
-      const outputBucket = resolveOutputGcsBucket(args);
-      const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
-        await persistOutputImages({
-          images: outputImages,
-          outputFilePrefix: args.outputFilePrefix,
-          outputGcsBucket: outputBucket,
-          outputGcsPrefix: args.outputGcsPrefix,
-          outputDir: args.outputDir,
-          requireGcsUpload: false,
-          skipGcsUpload: args.skipGcsUpload,
-        });
-
-      const detectedColors = colors
-        .map((color) => formatHexColor(color))
-        .join(", ");
-      content.push({
-        type: "text",
-        text: `Detected background colors: ${detectedColors}.`,
-      });
-      if (coverage < 0.6) {
-        content.push({
-          type: "text",
-          text: `Background coverage is ${(coverage * 100).toFixed(
-            1
-          )}%, results may be imperfect.`,
-        });
-      }
-      content.push({
-        type: "text",
-        text: "Generated 1 transparent image using checkerboard detection.",
-      });
-
-      if (uploadedOutputUris.length > 0) {
-        content.push({
-          type: "text",
-          text: `Uploaded 1 image to:\n${uploadedOutputUris.join("\n")}`,
-        });
-        content.push({
-          type: "text",
-          text: `HTTP URL(s) (requires bucket access):\n${uploadedOutputUrls.join(
-            "\n"
-          )}`,
-        });
-      }
-      content.push({
-        type: "text",
-        text: `Saved 1 image to:\n${savedPaths.join("\n")}`,
-      });
-
-      if (args.returnInlineData) {
-        const base64 = outputBuffer.toString("base64");
-        content.push({
-          type: "text",
-          text: `Inline data:\ndata:image/png;base64,${base64}`,
-        });
-      }
-
-      Object.assign(
-        structuredContent,
-        buildOutputStructuredContent({
-          outputImageUris: uploadedOutputUris,
-          outputImageUrls: uploadedOutputUrls,
-          savedPaths,
-          ...(args.returnInlineData
-            ? {
-                inlineData: [
-                  `data:image/png;base64,${outputBuffer.toString("base64")}`,
-                ],
-              }
-            : {}),
-        })
-      );
-
-      return Object.keys(structuredContent).length
-        ? { content, structuredContent }
-        : { content };
-    }
-
     throw new Error(`Unsupported method "${method}".`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -2077,19 +1665,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_generate_image",
       description:
-        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server will render on a key color and return a true transparent PNG automatically. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a polling task (or MCP task when explicitly requested) when auto-task mode is enabled to avoid client timeouts.",
+        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server asks the model for a transparent background, verifies the alpha channel, and falls back to IMG.LY background removal when needed. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a polling task (or MCP task when explicitly requested) when auto-task mode is enabled to avoid client timeouts.",
       inputSchema: {
         type: "object",
         properties: {
           prompt: {
             type: "string",
             description: "Text prompt for image generation.",
-          },
-          transparencyKeyColor: {
-            type: "string",
-            description:
-              "Hex key color for auto-transparency (used when prompt requests transparency).",
-            default: DEFAULT_TRANSPARENCY_KEY_COLOR,
           },
           opaqueBackgroundColor: {
             type: "string",
@@ -2275,7 +1857,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_make_transparent",
       description:
-        "Make a source image transparent (Gemini background removal or color-key) and save/upload the result.",
+        "Make a source image transparent (Gemini or IMG.LY background removal) and save/upload the result.",
       inputSchema: {
         type: "object",
         required: ["sourceImage"],
@@ -2315,32 +1897,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           method: {
             type: "string",
-            enum: ["imgly", "gemini", "color-key", "checkerboard"],
+            enum: ["imgly", "gemini"],
             description:
-              "imgly uses @imgly/background-removal-node; gemini uses Vertex; color-key removes a flat color locally; checkerboard detects two background colors from the border.",
+              "imgly uses @imgly/background-removal-node; gemini uses Vertex.",
             default: "imgly",
           },
           prompt: {
             type: "string",
             description:
               "Optional prompt override for gemini (default: remove background, transparent PNG).",
-          },
-          color: {
-            type: "string",
-            description:
-              "Hex color for color-key (e.g. #ffffff). Defaults to top-left pixel.",
-          },
-          tolerance: {
-            type: "number",
-            description: "Color distance tolerance (0-255).",
-            minimum: 0,
-            maximum: 255,
-          },
-          feather: {
-            type: "number",
-            description: "Soft edge feathering (0-255).",
-            minimum: 0,
-            maximum: 255,
           },
           returnInlineData: {
             type: "boolean",

@@ -183,7 +183,7 @@ Notes:
 Tool name: `nano_banana_generate_image`
 Tool name: `nano_banana_get_task` (polling fallback for auto-task 4K requests)
 
-If the prompt mentions transparency (for example "transparent background"), the server automatically renders on a solid key color and outputs a true transparent PNG in a single step.
+If the prompt mentions transparency (for example "transparent background"), the server asks the model for a transparent background, checks for an alpha channel, and falls back to IMG.LY background removal when the model returns an opaque image.
 
 Example arguments:
 
@@ -202,7 +202,6 @@ Optional fields:
 - `referenceImages`: array of `{ "mimeType": "image/png", "data": "<base64>" }` (legacy; prefer URIs or local paths)
 - `referenceImageUris`: array of `{ "mimeType": "image/png", "fileUri": "gs://bucket/path.png" }`
 - `referenceImagePaths`: array of `{ "path": "/abs/path.png", "mimeType": "image/png" }` (uploads to GCS)
-- `transparencyKeyColor`: hex key color used when auto transparency is triggered (default: `#00ff00`)
 - `opaqueBackgroundColor`: hex color (or `auto`) to flatten outputs and remove alpha when transparency is not requested; use `off` to keep alpha
 - `responseModalities`: `["IMAGE"]` or `["TEXT", "IMAGE"]`
 - `candidateCount`: integer 1-8
@@ -246,7 +245,7 @@ Example uploading a local image and using it as a reference:
 
 Tool name: `nano_banana_make_transparent`
 
-Use IMG.LY for local background removal (default), Gemini for cloud removal, or a local color-key for flat backgrounds. For “fake transparent” checkerboards, use `checkerboard`.
+Use IMG.LY for local background removal (default) or Gemini for cloud removal.
 
 Gemini example:
 
@@ -271,34 +270,7 @@ IMG.LY example:
 }
 ```
 
-Color-key example (white background):
-
-```json
-{
-  "method": "color-key",
-  "color": "#ffffff",
-  "tolerance": 18,
-  "feather": 12,
-  "sourceImage": {
-    "path": "/absolute/path/to/input.jpg"
-  }
-}
-```
-
-Checkerboard example (fake transparency):
-
-```json
-{
-  "method": "checkerboard",
-  "sourceImage": {
-    "path": "/absolute/path/to/fake-transparent.png"
-  }
-}
-```
-
 Notes:
-- `color-key` defaults to sampling the top-left pixel if `color` is omitted.
-- `checkerboard` auto-detects two background colors from the border.
 - Outputs are saved under `NANO_BANANA_OUTPUT_DIR` (and optionally uploaded to GCS).
 - Set `returnInlineData: true` to include base64 data URIs in the response.
 - `imgly` downloads ONNX/WASM assets on first run; you can self-host by setting `imglyPublicPath`.
