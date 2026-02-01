@@ -34,7 +34,6 @@ export NANO_BANANA_OUTPUT_DIR=~/nano-banana-outputs
 export NANO_BANANA_PROGRESS_INTERVAL_MS=20000
 export NANO_BANANA_AUTO_TASK_4K=false
 export NANO_BANANA_AUTO_TASK_TTL_MS=1200000
-export NANO_BANANA_OPAQUE_BACKGROUND_COLOR=auto
 ```
 
 Notes:
@@ -49,7 +48,6 @@ Notes:
 - `NANO_BANANA_PROGRESS_INTERVAL_MS` controls how often progress notifications are emitted (ms) to keep long MCP calls alive. Set `0` to disable.
 - `NANO_BANANA_AUTO_TASK_4K` runs 4K generations in task mode automatically to avoid client timeouts (set `true` to enable).
 - `NANO_BANANA_AUTO_TASK_TTL_MS` controls how long auto-task results remain available (ms). Set `0` for no expiry.
-- `NANO_BANANA_OPAQUE_BACKGROUND_COLOR` flattens non-transparent outputs onto a solid background (hex color or `auto` to sample the top-left pixel). Use `off` to keep alpha.
 - If you use GCS `fileUri` references, grant `Storage Object Viewer` to the Vertex AI service agent for the bucket.
 - If you use `referenceImagePaths`, the MCP service account needs `Storage Object Creator` (or broader) on the bucket.
 - For generated image uploads, the MCP service account needs `Storage Object Creator` (or broader) on the output bucket.
@@ -183,8 +181,6 @@ Notes:
 Tool name: `nano_banana_generate_image`
 Tool name: `nano_banana_get_task` (polling fallback for auto-task 4K requests)
 
-If the prompt mentions transparency (for example "transparent background"), the server asks the model for a transparent background, checks for an alpha channel, and falls back to IMG.LY background removal when the model returns an opaque image.
-
 Example arguments:
 
 ```json
@@ -202,7 +198,6 @@ Optional fields:
 - `referenceImages`: array of `{ "mimeType": "image/png", "data": "<base64>" }` (legacy; prefer URIs or local paths)
 - `referenceImageUris`: array of `{ "mimeType": "image/png", "fileUri": "gs://bucket/path.png" }`
 - `referenceImagePaths`: array of `{ "path": "/abs/path.png", "mimeType": "image/png" }` (uploads to GCS)
-- `opaqueBackgroundColor`: hex color (or `auto`) to flatten outputs and remove alpha when transparency is not requested; use `off` to keep alpha
 - `responseModalities`: `["IMAGE"]` or `["TEXT", "IMAGE"]`
 - `candidateCount`: integer 1-8
 - `imageSize`: `1K`, `2K`, `4K` (for models that support it)
@@ -240,41 +235,6 @@ Example uploading a local image and using it as a reference:
   ]
 }
 ```
-
-## Transparency tool
-
-Tool name: `nano_banana_make_transparent`
-
-Use IMG.LY for local background removal (default) or Gemini for cloud removal.
-
-Gemini example:
-
-```json
-{
-  "method": "gemini",
-  "sourceImage": {
-    "fileUri": "gs://my-bucket/input.png",
-    "mimeType": "image/png"
-  }
-}
-```
-
-IMG.LY example:
-
-```json
-{
-  "method": "imgly",
-  "sourceImage": {
-    "path": "/absolute/path/to/input.png"
-  }
-}
-```
-
-Notes:
-- Outputs are saved under `NANO_BANANA_OUTPUT_DIR` (and optionally uploaded to GCS).
-- Set `returnInlineData: true` to include base64 data URIs in the response.
-- `imgly` downloads ONNX/WASM assets on first run; you can self-host by setting `imglyPublicPath`.
-- `@imgly/background-removal-node` is licensed under AGPL (see their LICENSE.md for details).
 
 ## References
 

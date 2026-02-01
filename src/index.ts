@@ -19,11 +19,6 @@ import {
   InMemoryTaskStore,
 } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import { GoogleAuth } from "google-auth-library";
-import {
-  removeBackground,
-  type Config as ImglyConfig,
-} from "@imgly/background-removal-node";
-import sharp from "sharp";
 
 const DEFAULT_MODEL =
   process.env.NANO_BANANA_MODEL ?? "gemini-3-pro-image-preview";
@@ -42,24 +37,6 @@ const DEFAULT_OUTPUT_GCS_PREFIX =
 const DEFAULT_OUTPUT_DIR =
   process.env.NANO_BANANA_OUTPUT_DIR ??
   path.join(os.homedir(), "nano-banana-outputs");
-const DEFAULT_TRANSPARENT_PROMPT =
-  "Remove the background and make it transparent. Keep the main subject unchanged. Output a transparent PNG with an alpha channel. Do not render a checkerboard or any background pattern.";
-const DEFAULT_IMGLY_MODEL =
-  process.env.NANO_BANANA_IMGLY_MODEL?.trim() || "medium";
-const DEFAULT_IMGLY_OUTPUT_FORMAT =
-  process.env.NANO_BANANA_IMGLY_OUTPUT_FORMAT?.trim() || "image/png";
-const DEFAULT_IMGLY_PUBLIC_PATH =
-  process.env.NANO_BANANA_IMGLY_PUBLIC_PATH?.trim();
-const DEFAULT_IMGLY_OUTPUT_QUALITY = process.env
-  .NANO_BANANA_IMGLY_OUTPUT_QUALITY
-  ? Number(process.env.NANO_BANANA_IMGLY_OUTPUT_QUALITY)
-  : undefined;
-const RAW_OPAQUE_BACKGROUND_COLOR =
-  process.env.NANO_BANANA_OPAQUE_BACKGROUND_COLOR;
-const DEFAULT_OPAQUE_BACKGROUND_COLOR =
-  RAW_OPAQUE_BACKGROUND_COLOR === undefined
-    ? "auto"
-    : RAW_OPAQUE_BACKGROUND_COLOR.trim();
 const DEFAULT_PROGRESS_INTERVAL_MS = 20000;
 const DEFAULT_AUTO_TASK_4K = resolveAutoTask4k();
 const DEFAULT_AUTO_TASK_TTL_MS = resolveAutoTaskTtlMs();
@@ -90,7 +67,6 @@ type ToolArgs = {
   referenceImages?: ReferenceImage[];
   referenceImageUris?: ReferenceImageUri[];
   referenceImagePaths?: ReferenceImagePath[];
-  opaqueBackgroundColor?: string;
   aspectRatio?: string;
   imageSize?: string;
   includeText?: boolean;
@@ -105,39 +81,6 @@ type ToolArgs = {
   outputGcsPrefix?: string;
   outputDir?: string;
   outputFilePrefix?: string;
-};
-
-type SourceImageInput = {
-  mimeType?: string;
-  data?: string;
-  fileUri?: string;
-  path?: string;
-  displayName?: string;
-};
-
-type TransparentMethod = "gemini" | "imgly";
-
-type MakeTransparentArgs = {
-  sourceImage: SourceImageInput;
-  method?: TransparentMethod;
-  prompt?: string;
-  returnInlineData?: boolean;
-  skipGcsUpload?: boolean;
-  includeText?: boolean;
-  responseModalities?: Array<"TEXT" | "IMAGE">;
-  candidateCount?: number;
-  model?: string;
-  location?: string;
-  projectId?: string;
-  outputGcsBucket?: string;
-  outputGcsPrefix?: string;
-  outputDir?: string;
-  outputFilePrefix?: string;
-  imglyModel?: "small" | "medium" | "large";
-  imglyOutputFormat?: "image/png" | "image/jpeg" | "image/webp";
-  imglyOutputQuality?: number;
-  imglyPublicPath?: string;
-  imglyDebug?: boolean;
 };
 
 type PollingTaskArgs = {
@@ -168,10 +111,6 @@ type ProgressReporter = {
   report: (message?: string) => void;
   startHeartbeat: (message: string) => () => void;
 };
-
-type OpaqueBackgroundSetting =
-  | { mode: "auto" }
-  | { mode: "fixed"; color: { r: number; g: number; b: number }; raw: string };
 
 type PollingTaskStatus = "queued" | "working" | "completed" | "failed";
 
@@ -339,194 +278,6 @@ function inferMimeTypeFromUri(fileUri: string): string | null {
   const cleaned = fileUri.split("?")[0];
   const filename = cleaned.split("/").pop() ?? cleaned;
   return inferMimeTypeFromPath(filename);
-}
-
-function parseHexColor(input: string): { r: number; g: number; b: number } {
-  const trimmed = input.trim();
-  const hex = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
-  if (!/^[0-9a-fA-F]{3}$|^[0-9a-fA-F]{6}$/.test(hex)) {
-    throw new Error(
-      `Invalid color "${input}". Use hex like #fff or #ffffff.`
-    );
-  }
-
-  if (hex.length === 3) {
-    const r = parseInt(hex[0] + hex[0], 16);
-    const g = parseInt(hex[1] + hex[1], 16);
-    const b = parseInt(hex[2] + hex[2], 16);
-    return { r, g, b };
-  }
-
-  const r = parseInt(hex.slice(0, 2), 16);
-  const g = parseInt(hex.slice(2, 4), 16);
-  const b = parseInt(hex.slice(4, 6), 16);
-  return { r, g, b };
-}
-
-function parseGcsUri(fileUri: string): { bucket: string; objectName: string } {
-  if (!fileUri.startsWith("gs://")) {
-    throw new Error(`Only gs:// URIs are supported: ${fileUri}`);
-  }
-  const remainder = fileUri.slice("gs://".length);
-  const [bucket, ...rest] = remainder.split("/");
-  const objectName = rest.join("/");
-  if (!bucket || !objectName) {
-    throw new Error(`Invalid GCS URI: ${fileUri}`);
-  }
-  return { bucket, objectName };
-}
-
-function resolveOpaqueBackgroundSetting(
-  value?: string
-): OpaqueBackgroundSetting | null {
-  const raw =
-    value !== undefined
-      ? value.trim()
-      : DEFAULT_OPAQUE_BACKGROUND_COLOR?.trim();
-  if (!raw) {
-    return null;
-  }
-  const normalized = raw.toLowerCase();
-  if (
-    normalized === "off" ||
-    normalized === "none" ||
-    normalized === "false" ||
-    normalized === "no" ||
-    normalized === "disable" ||
-    normalized === "disabled"
-  ) {
-    return null;
-  }
-  if (normalized === "auto") {
-    return { mode: "auto" };
-  }
-  return { mode: "fixed", color: parseHexColor(raw), raw };
-}
-
-async function sampleTopLeftColor(buffer: Buffer) {
-  const { data } = await sharp(buffer, { failOnError: false })
-    .ensureAlpha()
-    .extract({ left: 0, top: 0, width: 1, height: 1 })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  return { r: data[0], g: data[1], b: data[2] };
-}
-
-async function resolveOpaqueBackgroundColor(
-  setting: OpaqueBackgroundSetting,
-  buffer: Buffer
-): Promise<{ r: number; g: number; b: number }> {
-  if (setting.mode === "fixed") {
-    return setting.color;
-  }
-  return sampleTopLeftColor(buffer);
-}
-
-async function flattenToOpaque(options: {
-  buffer: Buffer;
-  mimeType: string;
-  background: { r: number; g: number; b: number };
-}) {
-  if (options.mimeType === "image/jpeg") {
-    return options.buffer;
-  }
-
-  const pipeline = sharp(options.buffer, { failOnError: false }).flatten({
-    background: options.background,
-  });
-
-  if (options.mimeType === "image/webp") {
-    return pipeline.webp().toBuffer();
-  }
-
-  return pipeline.png().toBuffer();
-}
-
-function shouldAutoTransparent(prompt?: string): boolean {
-  if (!prompt) {
-    return false;
-  }
-  const normalized = prompt.toLowerCase();
-  const explicitTransparent =
-    normalized.includes("transparent background") ||
-    normalized.includes("transparent png") ||
-    normalized.includes("transparent pngs") ||
-    normalized.includes("transparent image") ||
-    normalized.includes("no background") ||
-    normalized.includes("remove background") ||
-    normalized.includes("alpha") ||
-    normalized.includes("transparency") ||
-    normalized.includes("transparent");
-  return explicitTransparent;
-}
-
-function buildNaturalTransparencyPrompt(originalPrompt: string) {
-  const trimmed = originalPrompt.trim();
-  if (!trimmed) {
-    return "Generate an image with a transparent background. Output a PNG with an alpha channel. Do not render a checkerboard, grid, or any background pattern.";
-  }
-  return [
-    trimmed,
-    "",
-    "Background must be transparent (alpha). Output a PNG with a transparent background. Do not render a checkerboard, grid, or any background pattern.",
-  ].join("\n");
-}
-
-async function hasTransparentPixels(buffer: Buffer): Promise<boolean> {
-  const { data } = await sharp(buffer, { failOnError: false })
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  for (let i = 3; i < data.length; i += 4) {
-    if (data[i] < 255) {
-      return true;
-    }
-  }
-  return false;
-}
-
-async function removeBackgroundWithImgly(options: {
-  buffer: Buffer;
-  mimeType: string;
-}) {
-  const outputFormatCandidate = DEFAULT_IMGLY_OUTPUT_FORMAT;
-  const outputFormat =
-    outputFormatCandidate === "image/webp" || outputFormatCandidate === "image/png"
-      ? outputFormatCandidate
-      : "image/png";
-  const modelCandidate = DEFAULT_IMGLY_MODEL;
-  const model =
-    modelCandidate === "small" ||
-    modelCandidate === "medium" ||
-    modelCandidate === "large"
-      ? modelCandidate
-      : "medium";
-  const publicPath = DEFAULT_IMGLY_PUBLIC_PATH;
-  const quality =
-    typeof DEFAULT_IMGLY_OUTPUT_QUALITY === "number"
-      ? DEFAULT_IMGLY_OUTPUT_QUALITY
-      : undefined;
-
-  const config: ImglyConfig = {
-    model,
-    output: {
-      format: outputFormat,
-      ...(typeof quality === "number" ? { quality } : {}),
-    },
-    ...(publicPath ? { publicPath } : {}),
-  };
-
-  const inputBlob = new Blob([new Uint8Array(options.buffer)], {
-    type: options.mimeType,
-  });
-  const blob = await removeBackground(inputBlob, config);
-  const outputBuffer = Buffer.from(await blob.arrayBuffer());
-
-  return {
-    buffer: outputBuffer,
-    mimeType: outputFormat,
-    model,
-  };
 }
 
 async function loadServiceAccount(): Promise<ServiceAccount> {
@@ -747,145 +498,6 @@ async function uploadBufferToGcs(options: {
       "Content-Type": options.mimeType,
     },
   });
-}
-
-async function downloadBufferFromGcs(options: {
-  bucket: string;
-  objectName: string;
-}): Promise<Buffer> {
-  const client = await getAuthClient();
-  const encodedObjectName = encodeURIComponent(options.objectName);
-  const url = `https://storage.googleapis.com/storage/v1/b/${options.bucket}/o/${encodedObjectName}?alt=media`;
-
-  const response = await client.request({
-    url,
-    method: "GET",
-    responseType: "arraybuffer",
-  });
-
-  return Buffer.from(response.data as ArrayBuffer);
-}
-
-async function resolveSourceImageBuffer(
-  sourceImage: SourceImageInput
-): Promise<{ buffer: Buffer; mimeType: string }> {
-  if (sourceImage.data) {
-    const mimeType = sourceImage.mimeType?.trim();
-    if (!mimeType) {
-      throw new Error("sourceImage.mimeType is required for base64 data.");
-    }
-    return {
-      buffer: Buffer.from(normalizeBase64(sourceImage.data), "base64"),
-      mimeType,
-    };
-  }
-
-  if (sourceImage.path) {
-    const resolvedPath = resolveLocalPath(sourceImage.path);
-    const mimeType =
-      sourceImage.mimeType ?? inferMimeTypeFromPath(resolvedPath);
-    if (!mimeType) {
-      throw new Error(
-        `MIME type not provided and could not be inferred for ${resolvedPath}.`
-      );
-    }
-    return {
-      buffer: await readFile(resolvedPath),
-      mimeType,
-    };
-  }
-
-  if (sourceImage.fileUri) {
-    const mimeType =
-      sourceImage.mimeType ?? inferMimeTypeFromUri(sourceImage.fileUri);
-    if (!mimeType) {
-      throw new Error(
-        `MIME type not provided and could not be inferred for ${sourceImage.fileUri}.`
-      );
-    }
-    const { bucket, objectName } = parseGcsUri(sourceImage.fileUri);
-    return {
-      buffer: await downloadBufferFromGcs({ bucket, objectName }),
-      mimeType,
-    };
-  }
-
-  throw new Error("sourceImage must include data, path, or fileUri.");
-}
-
-async function buildGeminiArgsForTransparency(
-  args: MakeTransparentArgs
-): Promise<ToolArgs> {
-  const prompt =
-    args.prompt?.trim() || DEFAULT_TRANSPARENT_PROMPT;
-  const toolArgs: ToolArgs = {
-    prompt,
-    includeText: args.includeText,
-    responseModalities: args.responseModalities,
-    candidateCount: args.candidateCount,
-    model: args.model,
-    location: args.location,
-    projectId: args.projectId,
-    outputGcsBucket: args.outputGcsBucket,
-    outputGcsPrefix: args.outputGcsPrefix,
-    outputDir: args.outputDir,
-    outputFilePrefix: args.outputFilePrefix,
-  };
-
-  const sourceImage = args.sourceImage;
-  if (sourceImage.data) {
-    if (!sourceImage.mimeType?.trim()) {
-      throw new Error("sourceImage.mimeType is required for base64 data.");
-    }
-    toolArgs.referenceImages = [
-      {
-        mimeType: sourceImage.mimeType.trim(),
-        data: sourceImage.data,
-      },
-    ];
-    return toolArgs;
-  }
-
-  if (sourceImage.path) {
-    const resolvedPath = resolveLocalPath(sourceImage.path);
-    const mimeType =
-      sourceImage.mimeType ?? inferMimeTypeFromPath(resolvedPath);
-    if (!mimeType) {
-      throw new Error(
-        `MIME type not provided and could not be inferred for ${resolvedPath}.`
-      );
-    }
-    const buffer = await readFile(resolvedPath);
-    toolArgs.referenceImages = [
-      {
-        mimeType,
-        data: buffer.toString("base64"),
-      },
-    ];
-    return toolArgs;
-  }
-
-  if (sourceImage.fileUri) {
-    const mimeType =
-      sourceImage.mimeType ?? inferMimeTypeFromUri(sourceImage.fileUri);
-    if (!mimeType) {
-      throw new Error(
-        `MIME type not provided and could not be inferred for ${sourceImage.fileUri}.`
-      );
-    }
-    toolArgs.referenceImageUris = [
-      {
-        mimeType,
-        fileUri: sourceImage.fileUri,
-        ...(sourceImage.displayName
-          ? { displayName: sourceImage.displayName }
-          : {}),
-      },
-    ];
-    return toolArgs;
-  }
-
-  throw new Error("sourceImage must include data, path, or fileUri.");
 }
 
 function extractImagesAndTexts(response: GenerateContentResponse) {
@@ -1119,16 +731,9 @@ async function handleGenerateImage(
 ): Promise<CallToolResult> {
   const stopHeartbeat = progress?.startHeartbeat("Generating image...");
   try {
-    if (shouldAutoTransparent(args.prompt)) {
-      return await handleGenerateImageWithTransparency(args, progress);
-    }
-
     progress?.report("Requesting image generation.");
     const result = await generateImage(args);
     const { images, texts } = extractImagesAndTexts(result.response);
-    const opaqueSetting = resolveOpaqueBackgroundSetting(
-      args.opaqueBackgroundColor
-    );
 
     const content: Array<{ type: "text"; text: string }> = [];
     const structuredContent = buildOutputStructuredContent({
@@ -1157,28 +762,10 @@ async function handleGenerateImage(
 
     if (images.length > 0) {
       progress?.report("Persisting generated images.");
-      const outputImages = await Promise.all(
-        images.map(async (image) => {
-          const rawBuffer = Buffer.from(
-            normalizeBase64(image.data),
-            "base64"
-          );
-          if (!opaqueSetting) {
-            return { mimeType: image.mimeType, data: rawBuffer };
-          }
-
-          const background = await resolveOpaqueBackgroundColor(
-            opaqueSetting,
-            rawBuffer
-          );
-          const data = await flattenToOpaque({
-            buffer: rawBuffer,
-            mimeType: image.mimeType,
-            background,
-          });
-          return { mimeType: image.mimeType, data };
-        })
-      );
+      const outputImages = images.map((image) => ({
+        mimeType: image.mimeType,
+        data: Buffer.from(normalizeBase64(image.data), "base64"),
+      }));
       const outputBucket = resolveOutputGcsBucket(args);
       const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
         await persistOutputImages({
@@ -1227,357 +814,6 @@ async function handleGenerateImage(
     return Object.keys(structuredContent).length
       ? { content, structuredContent }
       : { content };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: "text", text: `Nano Banana error: ${message}` }],
-      isError: true,
-    };
-  } finally {
-    stopHeartbeat?.();
-  }
-}
-
-async function handleGenerateImageWithTransparency(
-  args: ToolArgs,
-  progress?: ProgressReporter | null
-): Promise<CallToolResult> {
-  const content: Array<{ type: "text"; text: string }> = [];
-  try {
-    const transparencyPrompt = buildNaturalTransparencyPrompt(
-      args.prompt ?? ""
-    );
-
-    progress?.report("Requesting transparent image.");
-    const generateArgs: ToolArgs = {
-      ...args,
-      prompt: transparencyPrompt,
-    };
-    const result = await generateImage(generateArgs);
-    const { images, texts } = extractImagesAndTexts(result.response);
-    const structuredContent = buildOutputStructuredContent({
-      referenceImageUris: result.uploadedUris,
-    });
-
-    content.push({
-      type: "text",
-      text: `Generated ${images.length} transparent image(s).`,
-    });
-
-    if (args.includeText && texts.length > 0) {
-      content.push({ type: "text", text: texts.join("\n") });
-    }
-
-    if (result.uploadedUris.length > 0) {
-      content.push({
-        type: "text",
-        text: `Uploaded ${result.uploadedUris.length} reference image(s) to:\n${result.uploadedUris.join(
-          "\n"
-        )}`,
-      });
-    }
-
-    if (images.length > 0) {
-      progress?.report("Validating transparency.");
-      const outputImages = await Promise.all(
-        images.map(async (image, index) => {
-          const rawBuffer = Buffer.from(normalizeBase64(image.data), "base64");
-          const hasAlpha = await hasTransparentPixels(rawBuffer);
-          if (hasAlpha) {
-            return { mimeType: image.mimeType, data: rawBuffer };
-          }
-          progress?.report(
-            `No alpha detected in image ${index + 1}; removing background.`
-          );
-          const removed = await removeBackgroundWithImgly({
-            buffer: rawBuffer,
-            mimeType: image.mimeType,
-          });
-          return { mimeType: removed.mimeType, data: removed.buffer };
-        })
-      );
-
-      progress?.report("Persisting transparent outputs.");
-      const outputBucket = resolveOutputGcsBucket(args);
-      const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
-        await persistOutputImages({
-          images: outputImages,
-          outputFilePrefix: args.outputFilePrefix,
-          outputGcsBucket: outputBucket,
-          outputGcsPrefix: args.outputGcsPrefix,
-          outputDir: args.outputDir,
-          requireGcsUpload: true,
-        });
-
-      content.push({
-        type: "text",
-        text: `Uploaded ${uploadedOutputUris.length} transparent image(s) to:\n${uploadedOutputUris.join(
-          "\n"
-        )}`,
-      });
-      content.push({
-        type: "text",
-        text: `HTTP URL(s) (requires bucket access):\n${uploadedOutputUrls.join(
-          "\n"
-        )}`,
-      });
-      content.push({
-        type: "text",
-        text: `Saved ${savedPaths.length} image(s) to:\n${savedPaths.join("\n")}`,
-      });
-
-      Object.assign(
-        structuredContent,
-        buildOutputStructuredContent({
-          outputImageUris: uploadedOutputUris,
-          outputImageUrls: uploadedOutputUrls,
-          savedPaths,
-        })
-      );
-    }
-
-    if (images.length === 0 && texts.length > 0) {
-      content.push({
-        type: "text",
-        text: texts.join("\n"),
-      });
-    }
-
-    return Object.keys(structuredContent).length
-      ? { content, structuredContent }
-      : { content };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: "text", text: `Nano Banana error: ${message}` }],
-      isError: true,
-    };
-  }
-}
-
-async function handleMakeTransparent(
-  args: MakeTransparentArgs,
-  progress?: ProgressReporter | null
-): Promise<CallToolResult> {
-  const method: TransparentMethod = args.method ?? "imgly";
-  const heartbeatMessage =
-    method === "gemini"
-      ? "Generating transparent image..."
-      : "Removing background...";
-  const stopHeartbeat = progress?.startHeartbeat(heartbeatMessage);
-  try {
-    const content: Array<{ type: "text"; text: string }> = [];
-    const structuredContent: Record<string, unknown> = {};
-
-    if (method === "gemini") {
-      progress?.report("Requesting transparency via Gemini.");
-      const geminiArgs = await buildGeminiArgsForTransparency(args);
-      const result = await generateImage(geminiArgs);
-      const { images, texts } = extractImagesAndTexts(result.response);
-
-      content.push({
-        type: "text",
-        text: `Generated ${images.length} transparent image(s) with model ${
-          geminiArgs.model ?? DEFAULT_MODEL
-        }.`,
-      });
-
-      if (args.includeText && texts.length > 0) {
-        content.push({ type: "text", text: texts.join("\n") });
-      }
-
-      if (images.length > 0) {
-        const outputImages = images.map((image) => ({
-          mimeType: image.mimeType,
-          data: Buffer.from(normalizeBase64(image.data), "base64"),
-        }));
-        const outputBucket = resolveOutputGcsBucket(args);
-        const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
-          await persistOutputImages({
-            images: outputImages,
-            outputFilePrefix: args.outputFilePrefix,
-            outputGcsBucket: outputBucket,
-            outputGcsPrefix: args.outputGcsPrefix,
-            outputDir: args.outputDir,
-            requireGcsUpload: false,
-            skipGcsUpload: args.skipGcsUpload,
-          });
-
-        if (uploadedOutputUris.length > 0) {
-          content.push({
-            type: "text",
-            text: `Uploaded ${uploadedOutputUris.length} image(s) to:\n${uploadedOutputUris.join(
-              "\n"
-            )}`,
-          });
-          content.push({
-            type: "text",
-            text: `HTTP URL(s) (requires bucket access):\n${uploadedOutputUrls.join(
-              "\n"
-            )}`,
-          });
-        }
-        content.push({
-          type: "text",
-          text: `Saved ${savedPaths.length} image(s) to:\n${savedPaths.join("\n")}`,
-        });
-
-        const inlineData = args.returnInlineData
-          ? images.map((image) => {
-              const base64 = normalizeBase64(image.data);
-              return `data:${image.mimeType};base64,${base64}`;
-            })
-          : [];
-
-        if (args.returnInlineData) {
-          content.push({
-            type: "text",
-            text: `Inline data:\n${inlineData.join("\n")}`,
-          });
-        }
-
-        Object.assign(
-          structuredContent,
-          buildOutputStructuredContent({
-            outputImageUris: uploadedOutputUris,
-            outputImageUrls: uploadedOutputUrls,
-            savedPaths,
-            inlineData,
-          })
-        );
-      }
-
-      if (images.length === 0 && texts.length > 0) {
-        content.push({
-          type: "text",
-          text: texts.join("\n"),
-        });
-      }
-
-      return Object.keys(structuredContent).length
-        ? { content, structuredContent }
-        : { content };
-    }
-
-    if (method === "imgly") {
-      progress?.report("Running IMG.LY background removal.");
-      const { buffer, mimeType } = await resolveSourceImageBuffer(
-        args.sourceImage
-      );
-      const outputFormatCandidate =
-        args.imglyOutputFormat ?? DEFAULT_IMGLY_OUTPUT_FORMAT;
-      const outputFormat =
-        outputFormatCandidate === "image/png" ||
-        outputFormatCandidate === "image/jpeg" ||
-        outputFormatCandidate === "image/webp"
-          ? outputFormatCandidate
-          : "image/png";
-      const modelCandidate = args.imglyModel ?? DEFAULT_IMGLY_MODEL;
-      const model =
-        modelCandidate === "small" ||
-        modelCandidate === "medium" ||
-        modelCandidate === "large"
-          ? modelCandidate
-          : "medium";
-      const publicPath =
-        args.imglyPublicPath?.trim() || DEFAULT_IMGLY_PUBLIC_PATH;
-      const quality =
-        typeof args.imglyOutputQuality === "number"
-          ? args.imglyOutputQuality
-          : Number.isFinite(DEFAULT_IMGLY_OUTPUT_QUALITY)
-            ? DEFAULT_IMGLY_OUTPUT_QUALITY
-            : undefined;
-      const debug =
-        typeof args.imglyDebug === "boolean" ? args.imglyDebug : undefined;
-
-      const config: ImglyConfig = {
-        model,
-        output: {
-          format: outputFormat,
-          ...(typeof quality === "number" ? { quality } : {}),
-        },
-        ...(publicPath ? { publicPath } : {}),
-        ...(typeof debug === "boolean" ? { debug } : {}),
-      };
-
-      const inputBlob = new Blob([new Uint8Array(buffer)], {
-        type: mimeType,
-      });
-      const blob = await removeBackground(inputBlob, config);
-      const outputBuffer = Buffer.from(await blob.arrayBuffer());
-
-      const outputImages = [
-        {
-          mimeType: outputFormat,
-          data: outputBuffer,
-        },
-      ];
-      const outputBucket = resolveOutputGcsBucket(args);
-      const { uploadedOutputUris, uploadedOutputUrls, savedPaths } =
-        await persistOutputImages({
-          images: outputImages,
-          outputFilePrefix: args.outputFilePrefix,
-          outputGcsBucket: outputBucket,
-          outputGcsPrefix: args.outputGcsPrefix,
-          outputDir: args.outputDir,
-          requireGcsUpload: false,
-          skipGcsUpload: args.skipGcsUpload,
-        });
-
-      content.push({
-        type: "text",
-        text: `Generated 1 transparent image using IMG.LY (${model}).`,
-      });
-
-      if (uploadedOutputUris.length > 0) {
-        content.push({
-          type: "text",
-          text: `Uploaded 1 image to:\n${uploadedOutputUris.join("\n")}`,
-        });
-        content.push({
-          type: "text",
-          text: `HTTP URL(s) (requires bucket access):\n${uploadedOutputUrls.join(
-            "\n"
-          )}`,
-        });
-      }
-      content.push({
-        type: "text",
-        text: `Saved 1 image to:\n${savedPaths.join("\n")}`,
-      });
-
-      if (args.returnInlineData) {
-        const base64 = outputBuffer.toString("base64");
-        content.push({
-          type: "text",
-          text: `Inline data:\ndata:${outputFormat};base64,${base64}`,
-        });
-      }
-
-      Object.assign(
-        structuredContent,
-        buildOutputStructuredContent({
-          outputImageUris: uploadedOutputUris,
-          outputImageUrls: uploadedOutputUrls,
-          savedPaths,
-          ...(args.returnInlineData
-            ? {
-                inlineData: [
-                  `data:${outputFormat};base64,${outputBuffer.toString(
-                    "base64"
-                  )}`,
-                ],
-              }
-            : {}),
-        })
-      );
-
-      return Object.keys(structuredContent).length
-        ? { content, structuredContent }
-        : { content };
-    }
-
-    throw new Error(`Unsupported method "${method}".`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -1665,21 +901,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "nano_banana_generate_image",
       description:
-        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. If the prompt mentions transparency, the server asks the model for a transparent background, verifies the alpha channel, and falls back to IMG.LY background removal when needed. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a polling task (or MCP task when explicitly requested) when auto-task mode is enabled to avoid client timeouts.",
+        "Generate images with Gemini 3 Pro Image on Vertex AI and upload results to GCS. Prefer referenceImagePaths or referenceImageUris to avoid base64. For 4K imageSize requests, the server may return a polling task (or MCP task when explicitly requested) when auto-task mode is enabled to avoid client timeouts.",
       inputSchema: {
         type: "object",
         properties: {
           prompt: {
             type: "string",
             description: "Text prompt for image generation.",
-          },
-          opaqueBackgroundColor: {
-            type: "string",
-            description:
-              "Hex color (or 'auto') to flatten outputs and remove alpha when transparency is not requested. Use 'off' to keep alpha.",
-            ...(DEFAULT_OPAQUE_BACKGROUND_COLOR
-              ? { default: DEFAULT_OPAQUE_BACKGROUND_COLOR }
-              : {}),
           },
           referenceImages: {
             type: "array",
@@ -1854,164 +1082,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
-    {
-      name: "nano_banana_make_transparent",
-      description:
-        "Make a source image transparent (Gemini or IMG.LY background removal) and save/upload the result.",
-      inputSchema: {
-        type: "object",
-        required: ["sourceImage"],
-        properties: {
-          sourceImage: {
-            type: "object",
-            description:
-              "Source image input. Provide data (base64), fileUri (gs://), or path.",
-            properties: {
-              mimeType: {
-                type: "string",
-                description:
-                  "MIME type like image/png or image/jpeg (required for data or fileUri).",
-              },
-              data: {
-                type: "string",
-                description: "Base64 image data or data URI.",
-              },
-              fileUri: {
-                type: "string",
-                description: "GCS URI like gs://bucket/path.png.",
-              },
-              path: {
-                type: "string",
-                description: "Absolute or relative path to a local image.",
-              },
-              displayName: {
-                type: "string",
-                description: "Optional label for the image.",
-              },
-            },
-            anyOf: [
-              { required: ["data"] },
-              { required: ["fileUri"] },
-              { required: ["path"] },
-            ],
-          },
-          method: {
-            type: "string",
-            enum: ["imgly", "gemini"],
-            description:
-              "imgly uses @imgly/background-removal-node; gemini uses Vertex.",
-            default: "imgly",
-          },
-          prompt: {
-            type: "string",
-            description:
-              "Optional prompt override for gemini (default: remove background, transparent PNG).",
-          },
-          returnInlineData: {
-            type: "boolean",
-            description: "Return base64 data in the MCP response.",
-            default: false,
-          },
-          skipGcsUpload: {
-            type: "boolean",
-            description:
-              "Skip uploading to GCS (still saves locally).",
-            default: false,
-          },
-          includeText: {
-            type: "boolean",
-            description: "Include text parts in the MCP response.",
-            default: false,
-          },
-          responseModalities: {
-            type: "array",
-            description: "Override response modalities.",
-            items: {
-              type: "string",
-              enum: ["TEXT", "IMAGE"],
-            },
-          },
-          candidateCount: {
-            type: "integer",
-            description: "Number of candidates to request (1-8).",
-            minimum: 1,
-            maximum: 8,
-          },
-          model: {
-            type: "string",
-            description:
-              "Override the model ID (default: gemini-3-pro-image-preview).",
-          },
-          location: {
-            type: "string",
-            description:
-              "Vertex region (default: VERTEX_LOCATION or global).",
-          },
-          projectId: {
-            type: "string",
-            description:
-              "Override the GCP project ID (default from env or service account).",
-          },
-          outputGcsBucket: {
-            type: "string",
-            description: `GCS bucket for output uploads${
-              DEFAULT_OUTPUT_GCS_BUCKET
-                ? ` (default: ${DEFAULT_OUTPUT_GCS_BUCKET})`
-                : ""
-            }.`,
-            ...(DEFAULT_OUTPUT_GCS_BUCKET
-              ? { default: DEFAULT_OUTPUT_GCS_BUCKET }
-              : {}),
-          },
-          outputGcsPrefix: {
-            type: "string",
-            description: "GCS object prefix for output uploads.",
-            default: DEFAULT_OUTPUT_GCS_PREFIX,
-          },
-          outputDir: {
-            type: "string",
-            description:
-              "Directory to save outputs on disk (relative paths resolve under NANO_BANANA_OUTPUT_DIR).",
-            default: DEFAULT_OUTPUT_DIR,
-          },
-          outputFilePrefix: {
-            type: "string",
-            description:
-              "Optional filename prefix used when saving images and naming GCS objects.",
-          },
-          imglyModel: {
-            type: "string",
-            enum: ["small", "medium", "large"],
-            description:
-              "IMG.LY model size (small is faster, medium is higher quality).",
-            default: DEFAULT_IMGLY_MODEL,
-          },
-          imglyOutputFormat: {
-            type: "string",
-            enum: ["image/png", "image/jpeg", "image/webp"],
-            description: "Output format for IMG.LY background removal.",
-            default: DEFAULT_IMGLY_OUTPUT_FORMAT,
-          },
-          imglyOutputQuality: {
-            type: "number",
-            description: "Output quality for JPEG/WebP (0-1).",
-            minimum: 0,
-            maximum: 1,
-          },
-          imglyPublicPath: {
-            type: "string",
-            description:
-              "Custom public path for IMG.LY wasm/onnx assets (file:// or https://).",
-            default: DEFAULT_IMGLY_PUBLIC_PATH,
-          },
-          imglyDebug: {
-            type: "boolean",
-            description: "Enable IMG.LY debug logging.",
-            default: false,
-          },
-        },
-      },
-    },
   ],
 }));
 
@@ -2037,11 +1107,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       case "nano_banana_get_task":
         return handleGetPollingTask(
           request.params.arguments as PollingTaskArgs
-        );
-      case "nano_banana_make_transparent":
-        return handleMakeTransparent(
-          request.params.arguments as MakeTransparentArgs,
-          progressOverride
         );
       default:
         throw new Error(`Unknown tool: ${request.params.name}`);
